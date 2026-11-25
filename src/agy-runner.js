@@ -12,6 +12,22 @@ function checkMissingWarning(str) {
 }
 
 /**
+ * 决定「怎么调用 CLI」。Windows 不能直接 spawn 一个 .js 文件，即使它带
+ * shebang；官方 agy 是原生可执行文件，不受影响，这条分支只服务于
+ * 「用脚本冒充 CLI」的场合（测试桩、Windows 上的本地开发）。
+ *
+ * @param {string} bin
+ * @param {string[]} args
+ * @returns {{cmd: string, args: string[]}}
+ */
+function binSpec(bin, args = []) {
+  const viaNode = process.platform === 'win32' && /\.(c|m)?js$/i.test(bin);
+  return viaNode
+    ? { cmd: process.execPath, args: [bin, ...args] }
+    : { cmd: bin, args };
+}
+
+/**
  * @param {{
  *   prompt: string,
  *   model: string,
@@ -41,6 +57,7 @@ function runTurn(opts = {}) {
     const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : config.TURN_TIMEOUT_MS;
     const timeoutSec = Math.max(1, Math.ceil(timeoutMs / 1000));
     const onDelta = typeof opts.onDelta === 'function' ? opts.onDelta : null;
+    const onMissing = typeof opts.onMissing === 'function' ? opts.onMissing : null;
 
     // 刻意不传 -p：当前依靠管道 stdin 隐式进入 print 模式，保持现状以兼容长 prompt 管道输入
     const args = [
@@ -78,12 +95,9 @@ function runTurn(opts = {}) {
       env.AGY_CLI_AUTO_COMPACT_OVERRIDE = config.COMPACT_OVERRIDE;
     }
 
-    // Windows 不能直接 spawn 一个 .js 文件，即使它带 shebang。
-    // 官方 agy 是原生可执行文件，不受影响；这条分支只服务于「用脚本冒充 CLI」
-    // 的场合（测试桩、Windows 上的本地开发）。
-    const viaNode = process.platform === 'win32' && /\.(c|m)?js$/i.test(bin);
-    const spawnCmd = viaNode ? process.execPath : bin;
-    const spawnArgs = viaNode ? [bin, ...args] : args;
+    const spec = binSpec(bin, args);
+    const spawnCmd = spec.cmd;
+    const spawnArgs = spec.args;
 
     let child;
     try {
@@ -125,10 +139,22 @@ function runTurn(opts = {}) {
     let conversationId = opts.conversationId || null;
     let usage = null;
     let conversationMissing = false;
+    let missingNotified = false;
     let stderr = '';
     let rawStdout = '';
     let timedOut = false;
     let settled = false;
+
+    function triggerMissing() {
+      conversationMissing = true;
+      if (!missingNotified) {
+        missingNotified = true;
+        try { child.kill('SIGTERM'); } catch {}
+        if (onMissing) {
+          try { onMissing(); } catch {}
+        }
+      }
+    }
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -139,8 +165,10 @@ function runTurn(opts = {}) {
       const line = rawLine.trim();
       if (!line) return;
       if (checkMissingWarning(line)) {
-        conversationMissing = true;
+        triggerMissing();
+        return;
       }
+      if (conversationMissing) return;
       let evt;
       try {
         evt = JSON.parse(line);
@@ -155,12 +183,14 @@ function runTurn(opts = {}) {
       } else if (evt.event === 'step_update') {
         const su = evt.step_update || evt;
         if (su.step_type === 'agent_response' && typeof su.text_delta === 'string' && su.text_delta.length > 0) {
+          if (conversationMissing) return;
           deltaText += su.text_delta;
           if (onDelta) {
             try { onDelta(su.text_delta); } catch {}
           }
         }
       } else if (evt.event === 'result') {
+        if (conversationMissing) return;
         const res = evt.result || evt;
         if (typeof res.response === 'string' && res.response.length > 0) {
           resultText = res.response;
@@ -184,15 +214,15 @@ function runTurn(opts = {}) {
     function processStdoutStr(str) {
       if (!str) return;
       rawStdout += str;
-      if (checkMissingWarning(str)) {
-        conversationMissing = true;
-      }
       lineBuf += str;
       let idx;
       while ((idx = lineBuf.indexOf('\n')) >= 0) {
         const line = lineBuf.slice(0, idx);
         lineBuf = lineBuf.slice(idx + 1);
         handleLine(line);
+      }
+      if (checkMissingWarning(lineBuf) || checkMissingWarning(rawStdout)) {
+        triggerMissing();
       }
     }
 
@@ -205,7 +235,7 @@ function runTurn(opts = {}) {
       const str = typeof chunk === 'string' ? chunk : stderrDecoder.write(chunk);
       stderr += str;
       if (checkMissingWarning(str) || checkMissingWarning(stderr)) {
-        conversationMissing = true;
+        triggerMissing();
       }
     });
 
@@ -232,14 +262,16 @@ function runTurn(opts = {}) {
         lineBuf = '';
       }
       if (checkMissingWarning(stderr) || checkMissingWarning(rawStdout)) {
-        conversationMissing = true;
+        triggerMissing();
       }
       const exitCode = typeof code === 'number'
         ? code
         : (timedOut || signal === 'SIGKILL' ? 137 : (signal === 'SIGTERM' ? 143 : -1));
-      const text = (resultText !== null && resultText.length >= deltaText.length)
-        ? resultText
-        : (deltaText || resultText || '');
+      const text = conversationMissing
+        ? ''
+        : ((resultText !== null && resultText.length >= deltaText.length)
+          ? resultText
+          : (deltaText || resultText || ''));
 
       resolve({
         code: exitCode,
@@ -262,4 +294,4 @@ function runTurn(opts = {}) {
   });
 }
 
-module.exports = { runTurn };
+module.exports = { runTurn, binSpec };

@@ -6,7 +6,6 @@ const path = require('path');
 const SRC = path.join(__dirname, '..', 'src');
 const FAKE = path.join(__dirname, 'fake-agy.js');
 
-
 let pass = 0, fail = 0;
 async function t(name, fn) {
   try { await fn(); console.log('  ✅', name); pass++; }

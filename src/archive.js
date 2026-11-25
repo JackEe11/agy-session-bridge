@@ -7,6 +7,21 @@ const OPEN_TAG = '<ta_record>';
 const CLOSE_TAG = '</ta_record>';
 const HOLDBACK_BYTES = 24;
 
+function stripTrailingTagPrefix(s) {
+  if (!s) return '';
+  const openPrefixIdx = s.indexOf('<ta_');
+  if (openPrefixIdx !== -1) {
+    return s.slice(0, openPrefixIdx);
+  }
+  for (let len = OPEN_TAG.length - 1; len >= 2; len--) {
+    const prefix = OPEN_TAG.slice(0, len);
+    if (s.endsWith(prefix)) {
+      return s.slice(0, s.length - len);
+    }
+  }
+  return s;
+}
+
 function truncateUtf8(str, maxBytes) {
   if (maxBytes <= 0) return '';
   if (Buffer.byteLength(str, 'utf8') <= maxBytes) return str;
@@ -50,7 +65,7 @@ function recordFilter() {
           continue;
         }
         if (isFlush) {
-          out += buf;
+          out += stripTrailingTagPrefix(buf);
           buf = '';
           break;
         }

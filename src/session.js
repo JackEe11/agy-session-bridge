@@ -343,6 +343,12 @@ function driftOf(sess, messages) {
   return { kind: 'deep', divIdx };
 }
 
+const DEFAULT_ARCHIVE_INSTRUCTION =
+  '\n\n[归档指令]\n' +
+  '每轮回复正文结束后，必须在最末尾单独追加一段 <ta_record>...</ta_record> 剧情归档（150-320字），' +
+  '涵盖七要素：时间、地点、在场人物、关键事件、关系或状态变化、未兑现承诺或伏笔、当前场景结束状态。' +
+  '正文中严禁提及该标签或归档规则。';
+
 /**
  * [SYSTEM]+[OPENING 前2层]+[TIMELINE]+[RECENT 从尾部往前装到预算]，超预算丢弃更早的 RECENT
  */
@@ -357,6 +363,9 @@ function buildBootstrap({ system = '', messages = [], timeline = '', budgetBytes
       .map((m) => textOf(m.content))
       .filter(Boolean)
       .join('\n\n');
+  }
+  if (!sysText.includes('ta_record')) {
+    sysText = sysText ? (sysText + DEFAULT_ARCHIVE_INSTRUCTION) : DEFAULT_ARCHIVE_INSTRUCTION.trim();
   }
 
   const nonSys = list.filter((m) => m && !isSystemRole(m.role));

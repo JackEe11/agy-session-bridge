@@ -8,10 +8,63 @@ const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 
 const config = require('./config');
-const { runTurn } = require('./agy-runner');
+const { runTurn, binSpec } = require('./agy-runner');
 const session = require('./session');
 const archive = require('./archive');
-const { TurnQueue } = require('./queue');
+const { TurnQueue, BusyError } = require('./queue');
+
+const DEFAULT_ARCHIVE_INSTRUCTION =
+  '\n\n[归档指令]\n' +
+  '每轮回复正文结束后，必须在最末尾单独追加一段 <ta_record>...</ta_record> 剧情归档（150-320字），' +
+  '涵盖七要素：时间、地点、在场人物、关键事件、关系或状态变化、未兑现承诺或伏笔、当前场景结束状态。' +
+  '正文中严禁提及该标签或归档规则。';
+
+function ensureArchiveSystem(sysText) {
+  const s = typeof sysText === 'string' ? sysText : String(sysText || '');
+  if (s.includes('ta_record')) return s;
+  return s ? (s + DEFAULT_ARCHIVE_INSTRUCTION) : DEFAULT_ARCHIVE_INSTRUCTION.trim();
+}
+
+function stripTrailingTagPrefix(s) {
+  if (!s) return '';
+  const openTag = '<ta_record>';
+  const openPrefixIdx = s.indexOf('<ta_');
+  if (openPrefixIdx !== -1) {
+    return s.slice(0, openPrefixIdx);
+  }
+  for (let len = openTag.length - 1; len >= 2; len--) {
+    const prefix = openTag.slice(0, len);
+    if (s.endsWith(prefix)) {
+      return s.slice(0, s.length - len);
+    }
+  }
+  return s;
+}
+
+if (typeof session.buildBootstrap === 'function' && !session.buildBootstrap.__d7Wrapped) {
+  const origBuildBootstrap = session.buildBootstrap;
+  const wrappedBootstrap = function (opts = {}) {
+    const rawSys = typeof opts.system === 'string' ? opts.system : '';
+    return origBuildBootstrap({
+      ...opts,
+      system: ensureArchiveSystem(rawSys),
+    });
+  };
+  wrappedBootstrap.__d7Wrapped = true;
+  session.buildBootstrap = wrappedBootstrap;
+}
+
+if (typeof archive.recordFilter === 'function' && !archive.recordFilter.__d8Wrapped) {
+  const origRecordFilter = archive.recordFilter;
+  const wrappedRecordFilter = function () {
+    const f = origRecordFilter();
+    const origFlush = f.flush.bind(f);
+    f.flush = () => stripTrailingTagPrefix(origFlush());
+    return f;
+  };
+  wrappedRecordFilter.__d8Wrapped = true;
+  archive.recordFilter = wrappedRecordFilter;
+}
 
 const TOKEN_FILE = process.env.AGY_BRIDGE_TOKEN_FILE || path.join(config.HOME, '.agy-bridge', 'token');
 const SUMMARY_FILE = process.env.AGY_SUMMARY_FILE || path.join(config.HOME, '.agy-bridge', 'summaries.json');
@@ -84,10 +137,10 @@ function refreshModels() {
   if (now - modelsCacheAt < 10 * 60 * 1000 && MODELS.length > 0 && modelsCacheAt > 0) {
     return;
   }
-  const bin = process.env.AGY_BIN || config.AGY_BIN;
+  const spec = binSpec(process.env.AGY_BIN || config.AGY_BIN, ['models']);
   execFile(
-    bin,
-    ['models'],
+    spec.cmd,
+    spec.args,
     { env: { ...process.env, HOME: config.HOME }, timeout: 60000 },
     (err, stdout) => {
       if (err) {
@@ -124,10 +177,10 @@ function runQuota() {
     if (now - quotaCache.at < 60000 && quotaCache.text) {
       return resolve(quotaCache);
     }
-    const bin = process.env.AGY_BIN || config.AGY_BIN;
+    const spec = binSpec(process.env.AGY_BIN || config.AGY_BIN, ['-p', '/quota', '--print-timeout', '45s']);
     let child;
     try {
-      child = spawn(bin, ['-p', '/quota', '--print-timeout', '45s'], {
+      child = spawn(spec.cmd, spec.args, {
         cwd: process.cwd(),
         env: { ...process.env, HOME: config.HOME, ELECTRON_RUN_AS_NODE: '' },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -136,15 +189,21 @@ function runQuota() {
       quotaCache = { at: now, text: String(e.message), parsed: [] };
       return resolve(quotaCache);
     }
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (c) => { out += c.toString('utf8'); });
-    child.stderr.on('data', (c) => { err += c.toString('utf8'); });
+    const outChunks = [];
+    const errChunks = [];
+    child.stdout.on('data', (c) => {
+      outChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf8'));
+    });
+    child.stderr.on('data', (c) => {
+      errChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf8'));
+    });
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL'); } catch {}
     }, 50000);
     child.on('close', () => {
       clearTimeout(timer);
+      const out = Buffer.concat(outChunks).toString('utf8');
+      const err = Buffer.concat(errChunks).toString('utf8');
       const parsed = [];
       for (const line of out.split('\n')) {
         const parts = line.split('\t').map((s) => s.trim());
@@ -199,22 +258,110 @@ function sseChunk(res, model, delta, finish) {
   res.write('data: ' + JSON.stringify(payload) + '\n\n');
 }
 
-function sendSseError(res, model, headersSent, errMsg) {
-  if (res.writableEnded || res.destroyed) return;
-  const m = model || config.DEFAULT_MODEL;
-  if (!headersSent && !res.headersSent) {
+function createOutputter(res, { stream = true, model = config.DEFAULT_MODEL } = {}) {
+  const isStream = stream !== false && stream !== 'false';
+  let currentModel = model || config.DEFAULT_MODEL;
+  let headersSent = false;
+  let finished = false;
+  let content = '';
+
+  function ensureSseHeaders() {
+    if (!isStream || headersSent || res.headersSent || res.writableEnded || res.destroyed) return;
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
       connection: 'keep-alive',
     });
-    sseChunk(res, m, { role: 'assistant', content: '' }, null);
+    headersSent = true;
+    sseChunk(res, currentModel, { role: 'assistant', content: '' }, null);
   }
-  sseChunk(res, m, { content: '\n[桥接错误] ' + String(errMsg || 'unknown error') }, 'stop');
-  if (!res.writableEnded && !res.destroyed) {
-    res.write('data: [DONE]\n\n');
-    res.end();
-  }
+
+  return {
+    isStream,
+    get headersSent() {
+      return headersSent || res.headersSent;
+    },
+    get content() {
+      return content;
+    },
+    setModel(m) {
+      if (m) currentModel = m;
+    },
+    start() {
+      if (isStream) {
+        ensureSseHeaders();
+      }
+    },
+    reset() {
+      if (!headersSent && !res.headersSent) {
+        content = '';
+      }
+    },
+    delta(text) {
+      if (!text || finished || res.writableEnded || res.destroyed) return;
+      const str = String(text);
+      if (!str) return;
+      content += str;
+      if (isStream) {
+        ensureSseHeaders();
+        sseChunk(res, currentModel, { content: str }, null);
+      }
+    },
+    finish(usage) {
+      if (finished || res.writableEnded || res.destroyed) return;
+      finished = true;
+      if (isStream) {
+        ensureSseHeaders();
+        sseChunk(res, currentModel, {}, 'stop');
+        if (!res.writableEnded && !res.destroyed) {
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
+      } else {
+        const payload = {
+          id: 'chatcmpl-' + crypto.randomBytes(6).toString('hex'),
+          object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000),
+          model: currentModel,
+          choices: [
+            {
+              index: 0,
+              message: { role: 'assistant', content },
+              finish_reason: 'stop',
+            },
+          ],
+          usage: (usage && typeof usage === 'object')
+            ? usage
+            : { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        };
+        if (!res.headersSent) {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          headersSent = true;
+        }
+        res.end(JSON.stringify(payload));
+      }
+    },
+    error(msg, statusCode = 500) {
+      if (finished || res.writableEnded || res.destroyed) return;
+      finished = true;
+      const errText = String(msg || 'unknown error');
+      if (!headersSent && !res.headersSent) {
+        const code = statusCode === 429 ? 429 : 500;
+        const headers = { 'content-type': 'application/json; charset=utf-8' };
+        if (code === 429) {
+          headers['Retry-After'] = '3';
+        }
+        res.writeHead(code, headers);
+        headersSent = true;
+        res.end(JSON.stringify({ error: { message: errText } }));
+        return;
+      }
+      if (isStream && !res.writableEnded && !res.destroyed) {
+        res.write('data: [DONE]\n\n');
+        res.end();
+      }
+    },
+  };
 }
 
 /* ---- v4 Stateless Mode compatibility ---- */
@@ -315,7 +462,7 @@ function buildStatelessPrompt(messages, summary) {
   };
 }
 
-async function getStatelessSummary(key, droppedTurns) {
+async function getStatelessSummary(key, droppedTurns, signal) {
   if (!droppedTurns || !droppedTurns.length) return '';
   const entry = summaries[key];
   if (entry) {
@@ -333,17 +480,21 @@ async function getStatelessSummary(key, droppedTurns) {
     '必须保留：时间与地点、人物及关系变化、关键事件与结果、尚未兑现的承诺或伏笔、当前场景结束时的状态。\n' +
     '不要臆造，不要评价，只输出摘要正文。\n\n';
   try {
-    const r = await runTurn({
+    const r = await queue.run(key, () => runTurn({
       prompt: instruction + prev + fresh,
       model: SUMMARY_MODEL,
       effort: 'low',
-    });
+      signal,
+    }));
     const txt = (r.text || '').trim();
     if (!txt) return entry ? entry.summary || '' : '';
     summaries[key] = { covered: droppedTurns.length, summary: txt, at: Date.now() };
     summaryDirty = true;
     return txt;
-  } catch {
+  } catch (e) {
+    if (e instanceof BusyError || (e && (e.name === 'BusyError' || e.code === 'EBUSY'))) {
+      throw e;
+    }
     return entry ? entry.summary || '' : '';
   }
 }
@@ -451,22 +602,33 @@ const server = http.createServer((req, res) => {
     if (!res.writableEnded) ac.abort();
   });
 
-  let raw = '';
-  req.on('data', (c) => { raw += c.toString('utf8'); });
+  const reqChunks = [];
+  req.on('data', (c) => {
+    reqChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf8'));
+  });
   req.on('end', async () => {
+    const raw = Buffer.concat(reqChunks).toString('utf8');
     let body;
     try {
       body = JSON.parse(raw || '{}');
     } catch (e) {
       log('bad json request:', e.message);
-      return sendSseError(res, config.DEFAULT_MODEL, false, 'bad json: ' + e.message);
+      const errOut = createOutputter(res, { stream: false, model: config.DEFAULT_MODEL });
+      return errOut.error('bad json: ' + e.message, 500);
     }
 
     const model = (typeof body.model === 'string' && body.model.trim())
       ? body.model.trim()
       : config.DEFAULT_MODEL;
-    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+    const messages = rawMessages.map((m) => {
+      if (m && m.role === 'assistant') {
+        return { ...m, content: textOf(m.content).trim() };
+      }
+      return m;
+    });
     const effort = mapEffort(body.reasoning_effort);
+    const out = createOutputter(res, { stream: body.stream, model });
     const t0 = Date.now();
 
     // 1. Separate system text and non-system messages
@@ -478,20 +640,14 @@ const server = http.createServer((req, res) => {
     const nonSys = messages.filter((m) => m && m.role !== 'system' && m.role !== 'developer');
     const key = session.chatKey(messages);
 
-    if (!res.writableEnded && !res.destroyed) {
-      res.writeHead(200, {
-        'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-cache',
-        connection: 'keep-alive',
-      });
-      sseChunk(res, model, { role: 'assistant', content: '' }, null);
-    }
     const keepAlive = setInterval(() => {
       if (res.writableEnded || res.destroyed) {
         clearInterval(keepAlive);
         return;
       }
-      try { res.write(': keep-alive\n\n'); } catch {}
+      if (out.isStream && out.headersSent) {
+        try { res.write(': keep-alive\n\n'); } catch {}
+      }
     }, 5000);
 
     try {
@@ -499,7 +655,7 @@ const server = http.createServer((req, res) => {
       if (!isSessionMode()) {
         let built = buildStatelessPrompt(messages, '');
         if (built.meta.dropped.length) {
-          const sum = await getStatelessSummary(key, built.meta.dropped);
+          const sum = await getStatelessSummary(key, built.meta.dropped, ac.signal);
           if (sum) built = buildStatelessPrompt(messages, sum);
         }
         const prompt = built.prompt;
@@ -515,7 +671,8 @@ const server = http.createServer((req, res) => {
             onDelta: (delta) => {
               if (res.writableEnded || res.destroyed) return;
               sentCount += delta.length;
-              sseChunk(res, modelUsed, { content: delta }, null);
+              out.setModel(modelUsed);
+              out.delta(delta);
             },
           });
           if (resTurn.code !== 0 && !resTurn.text && sentCount === 0 && !ac.signal.aborted) {
@@ -523,6 +680,7 @@ const server = http.createServer((req, res) => {
             if (fb) {
               log('fallback(stateless)', { from: modelUsed, to: fb });
               modelUsed = fb;
+              out.setModel(modelUsed);
               resTurn = await runTurn({
                 prompt,
                 model: modelUsed,
@@ -531,7 +689,8 @@ const server = http.createServer((req, res) => {
                 onDelta: (delta) => {
                   if (res.writableEnded || res.destroyed) return;
                   sentCount += delta.length;
-                  sseChunk(res, modelUsed, { content: delta }, null);
+                  out.setModel(modelUsed);
+                  out.delta(delta);
                 },
               });
             }
@@ -540,19 +699,13 @@ const server = http.createServer((req, res) => {
         });
 
         clearInterval(keepAlive);
-        if (r.code !== 0 && !r.text && !ac.signal.aborted) {
+        if (r.code !== 0 && !ac.signal.aborted) {
           throw new Error(r.stderr || `agy exited with code ${r.code}`);
         }
         if (r.text && sentCount === 0) {
-          sseChunk(res, modelUsed, { content: r.text }, null);
+          out.delta(r.text);
         }
-        if (!res.writableEnded && !res.destroyed) {
-          sseChunk(res, modelUsed, {}, 'stop');
-          if (!res.writableEnded && !res.destroyed) {
-            res.write('data: [DONE]\n\n');
-            res.end();
-          }
-        }
+        out.finish(r.usage);
         log('turn done(stateless)', { key, ms: Date.now() - t0, chars: (r.text || '').length, modelUsed });
         return;
       }
@@ -570,25 +723,58 @@ const server = http.createServer((req, res) => {
 
       const workspaceDir = (rawSess && rawSess.dir) ? rawSess.dir : path.join(config.WORKSPACES, sessionKey);
       const timelinePath = path.join(workspaceDir, 'timeline.md');
+      const timelineBakPath = path.join(workspaceDir, 'timeline.bak.md');
       try {
         fs.mkdirSync(workspaceDir, { recursive: true });
       } catch {}
+
+      function backupTimelineIfNeeded() {
+        try {
+          if (fs.existsSync(timelinePath)) {
+            fs.copyFileSync(timelinePath, timelineBakPath);
+          }
+        } catch (err) {
+          log('timeline backup error:', err.message);
+        }
+      }
 
       let prompt = '';
       let convIdToUse = null;
       let nextSwipeStreak = 0;
       let isContinue = false;
+      let newMsgCount = 0;
 
       if (drift.kind === 'advance' || drift.kind === 'retry') {
-        const lastMsg = nonSys[nonSys.length - 1];
-        if (lastMsg && lastMsg.role === 'assistant') {
-          prompt = '请顺着你上一段回复继续写下去，不要重写已经写过的内容，不要复述。';
-          isContinue = true;
-        } else {
-          const lastUser = [...nonSys].reverse().find((m) => m && m.role === 'user') || lastMsg;
-          prompt = lastUser ? textOf(lastUser.content) : '';
+        const syncedLen = (effectiveSess && Array.isArray(effectiveSess.syncedHashes))
+          ? effectiveSess.syncedHashes.length
+          : 0;
+        const newMsgs = nonSys.slice(syncedLen);
+        newMsgCount = newMsgs.length;
+
+        if (newMsgs.length > 0) {
+          const bodyText = newMsgs
+            .map((m) => `[${(m && m.role) ? String(m.role) : 'user'}]\n${textOf(m ? m.content : '')}`)
+            .join('\n\n');
+          prompt = `[新消息]\n${bodyText}`;
           if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
             prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
+          }
+        } else {
+          const lastMsg = nonSys[nonSys.length - 1];
+          if (lastMsg && lastMsg.role === 'assistant') {
+            const prefill = textOf(lastMsg.content).trim();
+            prompt = prefill
+              ? `请从下面这句话接着写（不要重复这句本身，不要解释）：\n${prefill}`
+              : '请顺着你上一段回复继续写下去，不要重写已经写过的内容，不要复述。';
+            isContinue = true;
+          } else {
+            const lastUser = [...nonSys].reverse().find((m) => m && m.role === 'user') || lastMsg;
+            const roleLabel = (lastUser && lastUser.role) ? String(lastUser.role) : 'user';
+            const content = lastUser ? textOf(lastUser.content) : '';
+            prompt = `[新消息]\n[${roleLabel}]\n${content}`;
+            if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
+              prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
+            }
           }
         }
         convIdToUse = effectiveSess.convId;
@@ -600,9 +786,12 @@ const server = http.createServer((req, res) => {
         convIdToUse = effectiveSess.convId;
         nextSwipeStreak = ((effectiveSess && effectiveSess.swipeStreak) || 0) + 1;
       } else {
+        if (drift.divIdx === 0) {
+          backupTimelineIfNeeded();
+        }
         const timeline = archive.readTimeline(timelinePath, Math.floor(config.PROMPT_BUDGET * 0.2));
         prompt = session.buildBootstrap({
-          system: sysText,
+          system: ensureArchiveSystem(sysText),
           messages: nonSys,
           timeline,
           budgetBytes: config.PROMPT_BUDGET,
@@ -619,6 +808,8 @@ const server = http.createServer((req, res) => {
         model,
         promptBytes: Buffer.byteLength(prompt, 'utf8'),
         floors: nonSys.length,
+        newMsgCount,
+        promptSummary: prompt.replace(/\s+/g, ' ').slice(0, 160),
         ...(isContinue ? { continue: true } : {}),
       });
 
@@ -629,6 +820,13 @@ const server = http.createServer((req, res) => {
       let streamedText = '';
       let rebuiltInRequest = false;
 
+      const resetTurnBuffer = () => {
+        filter = archive.recordFilter();
+        rawDeltaCount = 0;
+        streamedText = '';
+        out.reset();
+      };
+
       const executeTurn = (turnPrompt, turnConvId) => runTurn({
         prompt: turnPrompt,
         model: modelUsed,
@@ -638,13 +836,18 @@ const server = http.createServer((req, res) => {
         cwd: workspaceDir,
         timeoutMs: config.TURN_TIMEOUT_MS,
         signal: ac.signal,
+        onMissing: () => {
+          resetTurnBuffer();
+        },
         onDelta: (delta) => {
           if (res.writableEnded || res.destroyed) return;
           rawDeltaCount += delta.length;
+          out.setModel(modelUsed);
+          out.start();
           const safe = filter.push(delta);
           if (safe) {
             streamedText += safe;
-            sseChunk(res, modelUsed, { content: safe }, null);
+            out.delta(safe);
           }
         },
       });
@@ -653,9 +856,10 @@ const server = http.createServer((req, res) => {
         let resTurn = await executeTurn(prompt, convIdToUse);
 
         if (resTurn.conversationMissing && !ac.signal.aborted) {
+          backupTimelineIfNeeded();
           const timeline = archive.readTimeline(timelinePath, Math.floor(config.PROMPT_BUDGET * 0.2));
           prompt = session.buildBootstrap({
-            system: sysText,
+            system: ensureArchiveSystem(sysText),
             messages: nonSys,
             timeline,
             budgetBytes: config.PROMPT_BUDGET,
@@ -663,9 +867,7 @@ const server = http.createServer((req, res) => {
           convIdToUse = null;
           nextSwipeStreak = 0;
           rebuiltInRequest = true;
-          filter = archive.recordFilter();
-          rawDeltaCount = 0;
-          streamedText = '';
+          resetTurnBuffer();
           log('rebuild on conversationMissing(session)', { key: sessionKey, model: modelUsed });
           resTurn = await executeTurn(prompt, null);
         }
@@ -675,9 +877,8 @@ const server = http.createServer((req, res) => {
           if (fb) {
             log('fallback(session)', { key: sessionKey, from: modelUsed, to: fb });
             modelUsed = fb;
-            filter = archive.recordFilter();
-            rawDeltaCount = 0;
-            streamedText = '';
+            out.setModel(modelUsed);
+            resetTurnBuffer();
             resTurn = await executeTurn(prompt, convIdToUse);
           }
         }
@@ -700,25 +901,17 @@ const server = http.createServer((req, res) => {
         throw new Error(r.stderr || (r.conversationMissing ? 'conversation missing after rebuild' : `agy exited with code ${r.code}`));
       }
 
-      if (rawDeltaCount === 0 && r.text) {
+      if (rawDeltaCount === 0 && r.text && r.code === 0) {
         const pushed = filter.push(r.text);
         if (pushed) {
           streamedText += pushed;
-          sseChunk(res, modelUsed, { content: pushed }, null);
+          out.delta(pushed);
         }
       }
       const tail = filter.flush();
       if (tail) {
         streamedText += tail;
-        sseChunk(res, modelUsed, { content: tail }, null);
-      }
-
-      if (!res.writableEnded && !res.destroyed) {
-        sseChunk(res, modelUsed, {}, 'stop');
-        if (!res.writableEnded && !res.destroyed) {
-          res.write('data: [DONE]\n\n');
-          res.end();
-        }
+        out.delta(tail);
       }
 
       // 6 & 7. Only commit state when r.code === 0 && !aborted && !r.conversationMissing
@@ -735,12 +928,13 @@ const server = http.createServer((req, res) => {
           code: r.code,
           ms: Date.now() - t0,
         });
+        out.error(r.stderr || (r.conversationMissing ? 'conversation missing' : `agy exited with code ${r.code}`), 500);
         return;
       }
 
       const { record } = archive.extractRecord(r.text || '');
       const currentFloor = nonSys.length;
-      if (drift.kind === 'deep') {
+      if (drift.kind === 'deep' && drift.divIdx > 0) {
         try {
           archive.upsertFloor(timelinePath, drift.divIdx, '');
         } catch (err) {
@@ -755,15 +949,27 @@ const server = http.createServer((req, res) => {
         }
       }
 
+      const trimmedReply = streamedText.trim();
       const syncedHashes = nonSys.map(session.layerHash);
-      syncedHashes.push(session.layerHash({ role: 'assistant', content: streamedText }));
+      if (isContinue && syncedHashes.length > 0) {
+        if (trimmedReply) {
+          const lastAssistant = nonSys[nonSys.length - 1];
+          const mergedContent = (textOf(lastAssistant && lastAssistant.content) + streamedText).trim();
+          syncedHashes[syncedHashes.length - 1] = session.layerHash({
+            role: 'assistant',
+            content: mergedContent,
+          });
+        }
+      } else if (trimmedReply) {
+        syncedHashes.push(session.layerHash({ role: 'assistant', content: trimmedReply }));
+      }
 
       const prevTurns = (drift.kind === 'deep' || rebuiltInRequest || !effectiveSess) ? 0 : (effectiveSess.turns || 0);
-      const turns = drift.kind === 'retry' ? Math.max(1, prevTurns) : prevTurns + 1;
+      const turns = (drift.kind === 'retry' && !rebuiltInRequest) ? Math.max(1, prevTurns) : prevTurns + 1;
       const forceDeepNext = turns >= config.MAX_TURNS_PER_SESSION;
 
-      const postTurnAlias = nonSys.length === 1
-        ? session.aliasKey([...messages, { role: 'assistant', content: streamedText }])
+      const postTurnAlias = (nonSys.length === 1 && trimmedReply)
+        ? session.aliasKey([...messages, { role: 'assistant', content: trimmedReply }])
         : null;
       const latestState = session.loadState();
       const prevRec = latestState[sessionKey] || rawSess || {};
@@ -796,6 +1002,7 @@ const server = http.createServer((req, res) => {
         conversationMissing: false,
       };
       session.saveState(latestState);
+      out.finish(r.usage);
 
       log('turn done(session)', {
         key: sessionKey,
@@ -810,7 +1017,8 @@ const server = http.createServer((req, res) => {
     } catch (e) {
       clearInterval(keepAlive);
       log('turn error:', e.message);
-      sendSseError(res, model, true, e.message);
+      const isBusy = e instanceof BusyError || Boolean(e && (e.name === 'BusyError' || e.code === 'EBUSY'));
+      out.error(e.message, isBusy ? 429 : 500);
     }
   });
 });
