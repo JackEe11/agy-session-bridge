@@ -152,10 +152,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now agy-bridge
 node tests/test-core.js     # 16 用例：核心逻辑
 node tests/test-fixes.js    #  4 用例：并发上限、抢占语义、UTF-8 跨块解码、env 透传
 node tests/test-fixes2.js   #  8 用例：会话键顺序、重复请求漂移、状态原子写
+node tests/test-fixes4.js   #  8 用例：未来记忆泄漏、SIGKILL 升级、代理对、TOCTOU、msg.name
+node tests/test-preset.js   #  4 用例：floor 切分、稳定 chatKey、override、bootstrap 提升
 node tests/test-server.js   #  4 用例：stream:false、错误状态码、失败不提交、哈希 trim 对齐
 ```
 
-共 **32 条**。覆盖：`recordFilter` 跨 delta 剥离、`upsertFloor` 幂等与回滚、`chatKey` 稳定性、`buildBootstrap` 预算、`driftOf` 三态、并发上限不被击穿、同角色卡双存档不串档、断连中止。
+共 **44 条**。覆盖：`recordFilter` 跨 delta 剥离、`upsertFloor` 幂等与回滚、`chatKey` 稳定性、`buildBootstrap` 预算、`driftOf` 三态、并发上限不被击穿、同角色卡双存档不串档、断连中止。
 
 ## 已知限制
 

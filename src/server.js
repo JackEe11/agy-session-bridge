@@ -8,10 +8,23 @@ const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 
 const config = require('./config');
-const { runTurn, binSpec } = require('./agy-runner');
+const { runTurn, terminateChild, binSpec } = require('./agy-runner');
 const session = require('./session');
 const archive = require('./archive');
 const { TurnQueue, BusyError } = require('./queue');
+
+const SYS_WORKSPACE = path.join(config.WORKSPACES, '_sys');
+try {
+  fs.mkdirSync(SYS_WORKSPACE, { recursive: true });
+} catch {}
+
+function ensureSysWorkspace() {
+  const dir = path.join(config.WORKSPACES, '_sys');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {}
+  return dir;
+}
 
 const DEFAULT_ARCHIVE_INSTRUCTION =
   '\n\n[归档指令]\n' +
@@ -23,47 +36,6 @@ function ensureArchiveSystem(sysText) {
   const s = typeof sysText === 'string' ? sysText : String(sysText || '');
   if (s.includes('ta_record')) return s;
   return s ? (s + DEFAULT_ARCHIVE_INSTRUCTION) : DEFAULT_ARCHIVE_INSTRUCTION.trim();
-}
-
-function stripTrailingTagPrefix(s) {
-  if (!s) return '';
-  const openTag = '<ta_record>';
-  const openPrefixIdx = s.indexOf('<ta_');
-  if (openPrefixIdx !== -1) {
-    return s.slice(0, openPrefixIdx);
-  }
-  for (let len = openTag.length - 1; len >= 2; len--) {
-    const prefix = openTag.slice(0, len);
-    if (s.endsWith(prefix)) {
-      return s.slice(0, s.length - len);
-    }
-  }
-  return s;
-}
-
-if (typeof session.buildBootstrap === 'function' && !session.buildBootstrap.__d7Wrapped) {
-  const origBuildBootstrap = session.buildBootstrap;
-  const wrappedBootstrap = function (opts = {}) {
-    const rawSys = typeof opts.system === 'string' ? opts.system : '';
-    return origBuildBootstrap({
-      ...opts,
-      system: ensureArchiveSystem(rawSys),
-    });
-  };
-  wrappedBootstrap.__d7Wrapped = true;
-  session.buildBootstrap = wrappedBootstrap;
-}
-
-if (typeof archive.recordFilter === 'function' && !archive.recordFilter.__d8Wrapped) {
-  const origRecordFilter = archive.recordFilter;
-  const wrappedRecordFilter = function () {
-    const f = origRecordFilter();
-    const origFlush = f.flush.bind(f);
-    f.flush = () => stripTrailingTagPrefix(origFlush());
-    return f;
-  };
-  wrappedRecordFilter.__d8Wrapped = true;
-  archive.recordFilter = wrappedRecordFilter;
 }
 
 const TOKEN_FILE = process.env.AGY_BRIDGE_TOKEN_FILE || path.join(config.HOME, '.agy-bridge', 'token');
@@ -92,6 +64,58 @@ function log(...args) {
 function isSessionMode() {
   if (process.env.AGY_SESSION_MODE === '0') return false;
   return Boolean(config.SESSION_MODE);
+}
+
+let seedSeq = 0;
+
+function trySeedTimeline(workspaceDir, floors) {
+  try {
+    if (!workspaceDir || !Array.isArray(floors) || floors.length === 0 || !floors[0]) {
+      return false;
+    }
+    const timelinePath = path.join(workspaceDir, 'timeline.md');
+    try {
+      const st = fs.statSync(timelinePath);
+      if (st.isFile() && st.size > 0) return false;
+    } catch {}
+
+    const firstContent = textOf(floors[0].content != null ? floors[0].content : floors[0]);
+    const firstTrimmed = firstContent.trim();
+    if (!firstTrimmed) return false;
+
+    let seedsDir = path.join(config.WORKSPACES, '_seeds');
+    const parentSeedsDir = path.join(path.dirname(workspaceDir), '_seeds');
+    if (parentSeedsDir !== seedsDir && fs.existsSync(parentSeedsDir)) {
+      seedsDir = parentSeedsDir;
+    }
+    if (!fs.existsSync(seedsDir)) return false;
+
+    const entries = fs.readdirSync(seedsDir).sort();
+    for (const file of entries) {
+      if (!file.endsWith('.sig')) continue;
+      const hash = file.slice(0, -4);
+      if (!hash) continue;
+      try {
+        const sigPath = path.join(seedsDir, file);
+        const sigText = fs.readFileSync(sigPath, 'utf8');
+        const sigPrefix = sigText.trim().slice(0, 40);
+        if (!sigPrefix) continue;
+
+        if (firstTrimmed.startsWith(sigPrefix) || firstContent.includes(sigPrefix)) {
+          const mdPath = path.join(seedsDir, `${hash}.md`);
+          const mdBuf = fs.readFileSync(mdPath);
+          if (!mdBuf || mdBuf.length === 0) continue;
+          fs.mkdirSync(workspaceDir, { recursive: true });
+          const tmpPath = `${timelinePath}.tmp.${process.pid}.${++seedSeq}`;
+          fs.writeFileSync(tmpPath, mdBuf);
+          fs.renameSync(tmpPath, timelinePath);
+          log(`timeline seeded: ${hash}`);
+          return true;
+        }
+      } catch {}
+    }
+  } catch {}
+  return false;
 }
 
 function textOf(content) {
@@ -141,7 +165,7 @@ function refreshModels() {
   execFile(
     spec.cmd,
     spec.args,
-    { env: { ...process.env, HOME: config.HOME }, timeout: 60000 },
+    { cwd: ensureSysWorkspace(), env: { ...process.env, HOME: config.HOME }, timeout: 60000 },
     (err, stdout) => {
       if (err) {
         log('refreshModels failed:', String(err.message).slice(0, 120));
@@ -181,7 +205,7 @@ function runQuota() {
     let child;
     try {
       child = spawn(spec.cmd, spec.args, {
-        cwd: process.cwd(),
+        cwd: ensureSysWorkspace(),
         env: { ...process.env, HOME: config.HOME, ELECTRON_RUN_AS_NODE: '' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -198,7 +222,7 @@ function runQuota() {
       errChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf8'));
     });
     const timer = setTimeout(() => {
-      try { child.kill('SIGKILL'); } catch {}
+      terminateChild(child);
     }, 50000);
     child.on('close', () => {
       clearTimeout(timer);
@@ -414,9 +438,10 @@ function buildStatelessPrompt(messages, summary) {
     if (!m || m.role === 'system' || m.role === 'developer') continue;
     const t = textOf(m.content);
     if (!t) continue;
-    if (m.role === 'user') turns.push('用户：' + t);
-    else if (m.role === 'assistant') turns.push('你：' + t);
-    else turns.push(m.role + '：' + t);
+    const nameSuffix = (m.name != null && String(m.name) !== '') ? `(${String(m.name)})` : '';
+    if (m.role === 'user') turns.push(`用户${nameSuffix}：` + t);
+    else if (m.role === 'assistant') turns.push(`你${nameSuffix}：` + t);
+    else turns.push(`${m.role}${nameSuffix}：` + t);
   }
 
   let head = sysFull ? '【设定与规则】\n' + sysFull : '';
@@ -484,6 +509,7 @@ async function getStatelessSummary(key, droppedTurns, signal) {
       prompt: instruction + prev + fresh,
       model: SUMMARY_MODEL,
       effort: 'low',
+      cwd: ensureSysWorkspace(),
       signal,
     }));
     const txt = (r.text || '').trim();
@@ -631,14 +657,20 @@ const server = http.createServer((req, res) => {
     const out = createOutputter(res, { stream: body.stream, model });
     const t0 = Date.now();
 
-    // 1. Separate system text and non-system messages
+    // 1. Separate system text and split preset blocks / floors; compute queueKey without reading sessions.json
     const sysText = messages
       .filter((m) => m && (m.role === 'system' || m.role === 'developer'))
       .map((m) => textOf(m.content))
       .filter(Boolean)
       .join('\n\n');
-    const nonSys = messages.filter((m) => m && m.role !== 'system' && m.role !== 'developer');
-    const key = session.chatKey(messages);
+    const { systemBlocks, floors: rawFloors, postBlocks } = session.splitFloors(messages);
+    const isEmptyFloorsFallback = rawFloors.length === 0;
+    const floors = isEmptyFloorsFallback
+      ? postBlocks.map((b) => ({ role: 'user', content: textOf(b) }))
+      : rawFloors;
+    const activePostBlocks = isEmptyFloorsFallback ? [] : postBlocks;
+    const { primary, alias } = session.chatKeys(messages);
+    const queueKey = alias || primary;
 
     const keepAlive = setInterval(() => {
       if (res.writableEnded || res.destroyed) {
@@ -655,18 +687,24 @@ const server = http.createServer((req, res) => {
       if (!isSessionMode()) {
         let built = buildStatelessPrompt(messages, '');
         if (built.meta.dropped.length) {
-          const sum = await getStatelessSummary(key, built.meta.dropped, ac.signal);
+          const sum = await getStatelessSummary(queueKey, built.meta.dropped, ac.signal);
           if (sum) built = buildStatelessPrompt(messages, sum);
         }
         const prompt = built.prompt;
 
         let modelUsed = model;
         let sentCount = 0;
-        const r = await queue.run(key, async () => {
+        const r = await queue.run(queueKey, async (ctx) => {
+          if (ctx && typeof ctx.addEventListener === 'function') {
+            if (ctx.aborted) ac.abort();
+            else ctx.addEventListener('abort', () => ac.abort(), { once: true });
+          }
+          const sysDir = ensureSysWorkspace();
           let resTurn = await runTurn({
             prompt,
             model: modelUsed,
             effort,
+            cwd: sysDir,
             signal: ac.signal,
             onDelta: (delta) => {
               if (res.writableEnded || res.destroyed) return;
@@ -685,6 +723,7 @@ const server = http.createServer((req, res) => {
                 prompt,
                 model: modelUsed,
                 effort,
+                cwd: sysDir,
                 signal: ac.signal,
                 onDelta: (delta) => {
                   if (res.writableEnded || res.destroyed) return;
@@ -696,171 +735,198 @@ const server = http.createServer((req, res) => {
             }
           }
           return resTurn;
-        });
+        }, { onPreempt: () => ac.abort() });
 
         clearInterval(keepAlive);
         if (r.code !== 0 && !ac.signal.aborted) {
           throw new Error(r.stderr || `agy exited with code ${r.code}`);
         }
-        if (r.text && sentCount === 0) {
+        if (r.text && sentCount === 0 && !ac.signal.aborted) {
           out.delta(r.text);
         }
         out.finish(r.usage);
-        log('turn done(stateless)', { key, ms: Date.now() - t0, chars: (r.text || '').length, modelUsed });
+        log('turn done(stateless)', { key: queueKey, ms: Date.now() - t0, chars: (r.text || '').length, modelUsed });
         return;
       }
 
-      // 3. Session mode: chatKey / alias -> driftOf -> prompt
-      const state = session.loadState();
-      const resolved = session.resolveSession(state, messages);
-      const sessionKey = resolved.key;
-      const rawSess = resolved.sess;
-      const effectiveSess = getEffectiveSession(rawSess);
-      const sessForDrift = rawSess
-        ? { ...rawSess, convId: effectiveSess ? effectiveSess.convId : null }
-        : null;
-      const drift = session.driftOf(sessForDrift, nonSys);
-
-      const workspaceDir = (rawSess && rawSess.dir) ? rawSess.dir : path.join(config.WORKSPACES, sessionKey);
-      const timelinePath = path.join(workspaceDir, 'timeline.md');
-      const timelineBakPath = path.join(workspaceDir, 'timeline.bak.md');
-      try {
-        fs.mkdirSync(workspaceDir, { recursive: true });
-      } catch {}
-
-      function backupTimelineIfNeeded() {
-        try {
-          if (fs.existsSync(timelinePath)) {
-            fs.copyFileSync(timelinePath, timelineBakPath);
-          }
-        } catch (err) {
-          log('timeline backup error:', err.message);
+      // 3. Session mode: all state reads, drift computation, execution, and commit happen inside queue.run
+      await queue.run(queueKey, async (ctx) => {
+        if (ctx && typeof ctx.addEventListener === 'function') {
+          if (ctx.aborted) ac.abort();
+          else ctx.addEventListener('abort', () => ac.abort(), { once: true });
         }
-      }
 
-      let prompt = '';
-      let convIdToUse = null;
-      let nextSwipeStreak = 0;
-      let isContinue = false;
-      let newMsgCount = 0;
+        const state = session.loadState();
+        const resolved = session.resolveSession(state, messages);
+        const sessionKey = resolved.key;
+        const rawSess = resolved.sess;
+        const effectiveSess = getEffectiveSession(rawSess);
+        const sessForDrift = rawSess
+          ? { ...rawSess, convId: effectiveSess ? effectiveSess.convId : null }
+          : null;
+        const drift = session.driftOf(sessForDrift, floors);
 
-      if (drift.kind === 'advance' || drift.kind === 'retry') {
-        const syncedLen = (effectiveSess && Array.isArray(effectiveSess.syncedHashes))
-          ? effectiveSess.syncedHashes.length
-          : 0;
-        const newMsgs = nonSys.slice(syncedLen);
-        newMsgCount = newMsgs.length;
+        const workspaceDir = (rawSess && rawSess.dir) ? rawSess.dir : path.join(config.WORKSPACES, sessionKey);
+        const timelinePath = path.join(workspaceDir, 'timeline.md');
+        const timelineBakPath = path.join(workspaceDir, 'timeline.bak.md');
+        try {
+          fs.mkdirSync(workspaceDir, { recursive: true });
+        } catch {}
 
-        if (newMsgs.length > 0) {
-          const bodyText = newMsgs
-            .map((m) => `[${(m && m.role) ? String(m.role) : 'user'}]\n${textOf(m ? m.content : '')}`)
-            .join('\n\n');
-          prompt = `[新消息]\n${bodyText}`;
-          if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
-            prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
+        function backupTimelineIfNeeded() {
+          if (ac.signal.aborted) return;
+          try {
+            if (fs.existsSync(timelinePath)) {
+              fs.copyFileSync(timelinePath, timelineBakPath);
+            }
+          } catch (err) {
+            log('timeline backup error:', err.message);
           }
-        } else {
-          const lastMsg = nonSys[nonSys.length - 1];
-          if (lastMsg && lastMsg.role === 'assistant') {
-            const prefill = textOf(lastMsg.content).trim();
-            prompt = prefill
-              ? `请从下面这句话接着写（不要重复这句本身，不要解释）：\n${prefill}`
-              : '请顺着你上一段回复继续写下去，不要重写已经写过的内容，不要复述。';
-            isContinue = true;
-          } else {
-            const lastUser = [...nonSys].reverse().find((m) => m && m.role === 'user') || lastMsg;
-            const roleLabel = (lastUser && lastUser.role) ? String(lastUser.role) : 'user';
-            const content = lastUser ? textOf(lastUser.content) : '';
-            prompt = `[新消息]\n[${roleLabel}]\n${content}`;
+        }
+
+        let prompt = '';
+        let convIdToUse = null;
+        let nextSwipeStreak = 0;
+        let isContinue = false;
+        let newMsgCount = 0;
+
+        if (drift.kind === 'advance' || drift.kind === 'retry') {
+          const sliceStart = drift.kind === 'advance'
+            ? drift.divIdx
+            : ((effectiveSess && Array.isArray(effectiveSess.syncedHashes)) ? effectiveSess.syncedHashes.length : floors.length);
+          const newMsgs = floors.slice(sliceStart);
+          newMsgCount = newMsgs.length;
+
+          if (newMsgs.length > 0) {
+            const bodyText = newMsgs
+              .map((m) => session.formatMessage(m))
+              .join('\n\n');
+            prompt = `[新消息]\n${bodyText}`;
             if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
               prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
             }
+          } else {
+            const lastMsg = floors[floors.length - 1];
+            if (lastMsg && lastMsg.role === 'assistant') {
+              const prefill = textOf(lastMsg.content).trim();
+              prompt = prefill
+                ? `请从下面这句话接着写（不要重复这句本身，不要解释）：\n${prefill}`
+                : '请顺着你上一段回复继续写下去，不要重写已经写过的内容，不要复述。';
+              isContinue = true;
+            } else {
+              const lastUser = [...floors].reverse().find((m) => m && m.role === 'user') || lastMsg;
+              prompt = `[新消息]\n${session.formatMessage(lastUser || { role: 'user', content: '' })}`;
+              if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
+                prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
+              }
+            }
           }
-        }
-        convIdToUse = effectiveSess.convId;
-        nextSwipeStreak = drift.kind === 'retry'
-          ? ((effectiveSess && typeof effectiveSess.swipeStreak === 'number') ? effectiveSess.swipeStreak : 0)
-          : 0;
-      } else if (drift.kind === 'shallow') {
-        prompt = session.buildOverride({ divIdx: drift.divIdx, messages: nonSys });
-        convIdToUse = effectiveSess.convId;
-        nextSwipeStreak = ((effectiveSess && effectiveSess.swipeStreak) || 0) + 1;
-      } else {
-        if (drift.divIdx === 0) {
-          backupTimelineIfNeeded();
-        }
-        const timeline = archive.readTimeline(timelinePath, Math.floor(config.PROMPT_BUDGET * 0.2));
-        prompt = session.buildBootstrap({
-          system: ensureArchiveSystem(sysText),
-          messages: nonSys,
-          timeline,
-          budgetBytes: config.PROMPT_BUDGET,
-        });
-        convIdToUse = null;
-        nextSwipeStreak = 0;
-      }
-
-      log('turn start(session)', {
-        key: sessionKey,
-        drift: drift.kind,
-        divIdx: drift.divIdx,
-        convId: convIdToUse || 'NEW',
-        model,
-        promptBytes: Buffer.byteLength(prompt, 'utf8'),
-        floors: nonSys.length,
-        newMsgCount,
-        promptSummary: prompt.replace(/\s+/g, ' ').slice(0, 160),
-        ...(isContinue ? { continue: true } : {}),
-      });
-
-      // 4 & 5. Run through TurnQueue and stream filtered deltas via recordFilter
-      let modelUsed = model;
-      let filter = archive.recordFilter();
-      let rawDeltaCount = 0;
-      let streamedText = '';
-      let rebuiltInRequest = false;
-
-      const resetTurnBuffer = () => {
-        filter = archive.recordFilter();
-        rawDeltaCount = 0;
-        streamedText = '';
-        out.reset();
-      };
-
-      const executeTurn = (turnPrompt, turnConvId) => runTurn({
-        prompt: turnPrompt,
-        model: modelUsed,
-        conversationId: turnConvId,
-        effort,
-        addDirs: [workspaceDir],
-        cwd: workspaceDir,
-        timeoutMs: config.TURN_TIMEOUT_MS,
-        signal: ac.signal,
-        onMissing: () => {
-          resetTurnBuffer();
-        },
-        onDelta: (delta) => {
-          if (res.writableEnded || res.destroyed) return;
-          rawDeltaCount += delta.length;
-          out.setModel(modelUsed);
-          out.start();
-          const safe = filter.push(delta);
-          if (safe) {
-            streamedText += safe;
-            out.delta(safe);
+          convIdToUse = effectiveSess.convId;
+          nextSwipeStreak = drift.kind === 'retry'
+            ? ((effectiveSess && typeof effectiveSess.swipeStreak === 'number') ? effectiveSess.swipeStreak : 0)
+            : 0;
+        } else if (drift.kind === 'shallow') {
+          prompt = session.buildOverride({ divIdx: drift.divIdx, floors });
+          convIdToUse = effectiveSess.convId;
+          nextSwipeStreak = ((effectiveSess && effectiveSess.swipeStreak) || 0) + 1;
+        } else {
+          if (drift.divIdx === 0) {
+            backupTimelineIfNeeded();
           }
-        },
-      });
-
-      const r = await queue.run(sessionKey, async () => {
-        let resTurn = await executeTurn(prompt, convIdToUse);
-
-        if (resTurn.conversationMissing && !ac.signal.aborted) {
-          backupTimelineIfNeeded();
-          const timeline = archive.readTimeline(timelinePath, Math.floor(config.PROMPT_BUDGET * 0.2));
+          trySeedTimeline(workspaceDir, floors);
+          const timeline = archive.readTimeline(
+            timelinePath,
+            Math.floor(config.PROMPT_BUDGET * 0.2),
+            drift.divIdx > 0 ? drift.divIdx : undefined
+          );
           prompt = session.buildBootstrap({
-            system: ensureArchiveSystem(sysText),
-            messages: nonSys,
+            system: sysText,
+            systemBlocks,
+            floors,
+            postBlocks: activePostBlocks,
+            messages,
+            timeline,
+            budgetBytes: config.PROMPT_BUDGET,
+          });
+          convIdToUse = null;
+          nextSwipeStreak = 0;
+        }
+
+        const presetBlockBytes = systemBlocks.reduce((acc, b) => acc + Buffer.byteLength(textOf(b), 'utf8'), 0);
+        const postBlockBytes = postBlocks.reduce((acc, b) => acc + Buffer.byteLength(textOf(b), 'utf8'), 0);
+        const firstFloorPreview = floors[0] ? textOf(floors[0].content).replace(/\s+/g, ' ').slice(0, 40) : '';
+
+        log('turn start(session)', {
+          key: sessionKey,
+          drift: drift.kind,
+          divIdx: drift.divIdx,
+          convId: convIdToUse || 'NEW',
+          model,
+          promptBytes: Buffer.byteLength(prompt, 'utf8'),
+          floors: floors.length,
+          floorCount: floors.length,
+          presetBlockBytes,
+          postBlockBytes,
+          firstFloorPreview,
+          newMsgCount,
+          promptSummary: prompt.replace(/\s+/g, ' ').slice(0, 160),
+          ...(isContinue ? { continue: true } : {}),
+        });
+
+        let modelUsed = model;
+        let filter = archive.recordFilter();
+        let rawDeltaCount = 0;
+        let streamedText = '';
+        let rebuiltInRequest = false;
+
+        const resetTurnBuffer = () => {
+          filter = archive.recordFilter();
+          rawDeltaCount = 0;
+          streamedText = '';
+          out.reset();
+        };
+
+        const executeTurn = (turnPrompt, turnConvId) => runTurn({
+          prompt: turnPrompt,
+          model: modelUsed,
+          conversationId: turnConvId,
+          effort,
+          addDirs: [workspaceDir],
+          cwd: workspaceDir,
+          timeoutMs: config.TURN_TIMEOUT_MS,
+          signal: ac.signal,
+          onMissing: () => {
+            resetTurnBuffer();
+          },
+          onDelta: (delta) => {
+            if (res.writableEnded || res.destroyed || ac.signal.aborted) return;
+            rawDeltaCount += delta.length;
+            out.setModel(modelUsed);
+            out.start();
+            const safe = filter.push(delta);
+            if (safe) {
+              streamedText += safe;
+              out.delta(safe);
+            }
+          },
+        });
+
+        let r = await executeTurn(prompt, convIdToUse);
+
+        if (r.conversationMissing && !ac.signal.aborted) {
+          backupTimelineIfNeeded();
+          trySeedTimeline(workspaceDir, floors);
+          const timeline = archive.readTimeline(
+            timelinePath,
+            Math.floor(config.PROMPT_BUDGET * 0.2),
+            drift.divIdx > 0 ? drift.divIdx : undefined
+          );
+          prompt = session.buildBootstrap({
+            system: sysText,
+            systemBlocks,
+            floors,
+            postBlocks: activePostBlocks,
+            messages,
             timeline,
             budgetBytes: config.PROMPT_BUDGET,
           });
@@ -869,151 +935,157 @@ const server = http.createServer((req, res) => {
           rebuiltInRequest = true;
           resetTurnBuffer();
           log('rebuild on conversationMissing(session)', { key: sessionKey, model: modelUsed });
-          resTurn = await executeTurn(prompt, null);
+          r = await executeTurn(prompt, null);
         }
 
-        if (resTurn.code !== 0 && !resTurn.text && rawDeltaCount === 0 && !ac.signal.aborted) {
-          const fb = pickFallback(modelUsed, resTurn.stderr);
+        if (r.code !== 0 && !r.text && rawDeltaCount === 0 && !ac.signal.aborted) {
+          const fb = pickFallback(modelUsed, r.stderr);
           if (fb) {
             log('fallback(session)', { key: sessionKey, from: modelUsed, to: fb });
             modelUsed = fb;
             out.setModel(modelUsed);
             resetTurnBuffer();
-            resTurn = await executeTurn(prompt, convIdToUse);
+            r = await executeTurn(prompt, convIdToUse);
           }
         }
-        return resTurn;
-      });
 
-      clearInterval(keepAlive);
-      const aborted = ac.signal.aborted || res.writableEnded || res.destroyed;
+        clearInterval(keepAlive);
+        const aborted = ac.signal.aborted || Boolean(ctx && ctx.aborted) || res.writableEnded || res.destroyed;
 
-      if (!aborted && (r.conversationMissing || (r.code !== 0 && !r.text && rawDeltaCount === 0))) {
-        const reason = r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`;
-        log('turn done(session)', {
-          key: sessionKey,
-          drift: drift.kind,
-          stateCommit: false,
-          reason,
-          code: r.code,
-          ms: Date.now() - t0,
-        });
-        throw new Error(r.stderr || (r.conversationMissing ? 'conversation missing after rebuild' : `agy exited with code ${r.code}`));
-      }
-
-      if (rawDeltaCount === 0 && r.text && r.code === 0) {
-        const pushed = filter.push(r.text);
-        if (pushed) {
-          streamedText += pushed;
-          out.delta(pushed);
-        }
-      }
-      const tail = filter.flush();
-      if (tail) {
-        streamedText += tail;
-        out.delta(tail);
-      }
-
-      // 6 & 7. Only commit state when r.code === 0 && !aborted && !r.conversationMissing
-      const canCommit = r.code === 0 && !aborted && !ac.signal.aborted && !r.conversationMissing;
-      if (!canCommit) {
-        const reason = (aborted || ac.signal.aborted)
-          ? 'aborted'
-          : (r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`);
-        log('turn done(session)', {
-          key: sessionKey,
-          drift: drift.kind,
-          stateCommit: false,
-          reason,
-          code: r.code,
-          ms: Date.now() - t0,
-        });
-        out.error(r.stderr || (r.conversationMissing ? 'conversation missing' : `agy exited with code ${r.code}`), 500);
-        return;
-      }
-
-      const { record } = archive.extractRecord(r.text || '');
-      const currentFloor = nonSys.length;
-      if (drift.kind === 'deep' && drift.divIdx > 0) {
-        try {
-          archive.upsertFloor(timelinePath, drift.divIdx, '');
-        } catch (err) {
-          log('upsertFloor error:', err.message);
-        }
-      }
-      if (record !== null || drift.kind === 'shallow') {
-        try {
-          archive.upsertFloor(timelinePath, currentFloor, record || '');
-        } catch (err) {
-          log('upsertFloor error:', err.message);
-        }
-      }
-
-      const trimmedReply = streamedText.trim();
-      const syncedHashes = nonSys.map(session.layerHash);
-      if (isContinue && syncedHashes.length > 0) {
-        if (trimmedReply) {
-          const lastAssistant = nonSys[nonSys.length - 1];
-          const mergedContent = (textOf(lastAssistant && lastAssistant.content) + streamedText).trim();
-          syncedHashes[syncedHashes.length - 1] = session.layerHash({
-            role: 'assistant',
-            content: mergedContent,
+        if (!aborted && (r.conversationMissing || (r.code !== 0 && !r.text && rawDeltaCount === 0))) {
+          const reason = r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`;
+          log('turn done(session)', {
+            key: sessionKey,
+            drift: drift.kind,
+            stateCommit: false,
+            reason,
+            code: r.code,
+            ms: Date.now() - t0,
           });
+          throw new Error(r.stderr || (r.conversationMissing ? 'conversation missing after rebuild' : `agy exited with code ${r.code}`));
         }
-      } else if (trimmedReply) {
-        syncedHashes.push(session.layerHash({ role: 'assistant', content: trimmedReply }));
-      }
 
-      const prevTurns = (drift.kind === 'deep' || rebuiltInRequest || !effectiveSess) ? 0 : (effectiveSess.turns || 0);
-      const turns = (drift.kind === 'retry' && !rebuiltInRequest) ? Math.max(1, prevTurns) : prevTurns + 1;
-      const forceDeepNext = turns >= config.MAX_TURNS_PER_SESSION;
-
-      const postTurnAlias = (nonSys.length === 1 && trimmedReply)
-        ? session.aliasKey([...messages, { role: 'assistant', content: trimmedReply }])
-        : null;
-      const latestState = session.loadState();
-      const prevRec = latestState[sessionKey] || rawSess || {};
-      const candidateKeys = Array.from(new Set([
-        ...(Array.isArray(prevRec.keys) ? prevRec.keys : []),
-        ...(Array.isArray(resolved.keys) ? resolved.keys : []),
-        postTurnAlias,
-      ].filter(Boolean)));
-      const mergedKeys = candidateKeys.filter((k) => {
-        if (latestState[k] && k !== sessionKey) return false;
-        for (const [otherKey, otherRec] of Object.entries(latestState)) {
-          if (otherKey === sessionKey) continue;
-          if (otherRec && Array.isArray(otherRec.keys) && otherRec.keys.includes(k)) {
-            return false;
+        if (!aborted) {
+          if (rawDeltaCount === 0 && r.text && r.code === 0) {
+            const pushed = filter.push(r.text);
+            if (pushed) {
+              streamedText += pushed;
+              out.delta(pushed);
+            }
+          }
+          const tail = filter.flush();
+          if (tail) {
+            streamedText += tail;
+            out.delta(tail);
           }
         }
-        return true;
-      });
 
-      latestState[sessionKey] = {
-        convId: forceDeepNext ? null : (r.conversationId || convIdToUse || null),
-        model: modelUsed,
-        turns,
-        keys: mergedKeys,
-        syncedHashes,
-        swipeStreak: nextSwipeStreak,
-        dir: workspaceDir,
-        sysHead: prevRec.sysHead || resolved.sysHead,
-        updatedAt: Date.now(),
-        conversationMissing: false,
-      };
-      session.saveState(latestState);
-      out.finish(r.usage);
+        // Only commit state and write timeline when r.code === 0 && !aborted && !ac.signal.aborted && !r.conversationMissing
+        const canCommit = r.code === 0 && !aborted && !ac.signal.aborted && !r.conversationMissing;
+        if (!canCommit) {
+          const reason = (aborted || ac.signal.aborted)
+            ? 'aborted'
+            : (r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`);
+          log('turn done(session)', {
+            key: sessionKey,
+            drift: drift.kind,
+            stateCommit: false,
+            reason,
+            code: r.code,
+            ms: Date.now() - t0,
+          });
+          out.error(r.stderr || (r.conversationMissing ? 'conversation missing' : `agy exited with code ${r.code}`), 500);
+          return;
+        }
 
-      log('turn done(session)', {
-        key: sessionKey,
-        drift: drift.kind,
-        convId: latestState[sessionKey].convId,
-        turns,
-        forceDeepNext,
-        hasRecord: record !== null,
-        ...(isContinue ? { continue: true } : {}),
-        ms: Date.now() - t0,
-      });
+        const { record } = archive.extractRecord(r.text || '');
+        const currentFloor = floors.length;
+        if (drift.kind === 'deep' && drift.divIdx > 0) {
+          try {
+            archive.upsertFloor(timelinePath, drift.divIdx, '');
+          } catch (err) {
+            log('upsertFloor error:', err.message);
+          }
+        }
+        if (record !== null || drift.kind === 'shallow') {
+          try {
+            archive.upsertFloor(timelinePath, currentFloor, record || '');
+          } catch (err) {
+            log('upsertFloor error:', err.message);
+          }
+        }
+
+        const trimmedReply = streamedText.trim();
+        const syncedHashes = floors.map(session.layerHash);
+        const numberedFloorCount = floors.filter((f) => session.FLOOR_MARKER_HEAD_RE.test(textOf(f.content))).length;
+        const lastFloorHasMarker = floors.length > 0 && session.FLOOR_MARKER_HEAD_RE.test(textOf(floors[floors.length - 1].content));
+
+        if (isContinue && syncedHashes.length > 0) {
+          if (trimmedReply && !lastFloorHasMarker) {
+            const lastAssistant = floors[floors.length - 1];
+            const mergedContent = (textOf(lastAssistant && lastAssistant.content) + streamedText).trim();
+            syncedHashes[syncedHashes.length - 1] = session.layerHash({
+              ...(lastAssistant && lastAssistant.name != null ? { name: lastAssistant.name } : {}),
+              role: 'assistant',
+              content: mergedContent,
+            });
+          }
+        } else if (trimmedReply && !lastFloorHasMarker) {
+          syncedHashes.push(session.layerHash({ role: 'assistant', content: trimmedReply }));
+        }
+
+        const prevTurns = (drift.kind === 'deep' || rebuiltInRequest || !effectiveSess) ? 0 : (effectiveSess.turns || 0);
+        const turns = (drift.kind === 'retry' && !rebuiltInRequest) ? Math.max(1, prevTurns) : prevTurns + 1;
+        const forceDeepNext = turns >= config.MAX_TURNS_PER_SESSION;
+
+        const postTurnAlias = (floors.length === 1 && trimmedReply)
+          ? session.aliasKey([{ role: 'system', content: sysText }, floors[0], { role: 'assistant', content: trimmedReply }])
+          : null;
+        const latestState = session.loadState();
+        const prevRec = latestState[sessionKey] || rawSess || {};
+        const candidateKeys = Array.from(new Set([
+          ...(Array.isArray(prevRec.keys) ? prevRec.keys : []),
+          ...(Array.isArray(resolved.keys) ? resolved.keys : []),
+          postTurnAlias,
+        ].filter(Boolean)));
+        const mergedKeys = candidateKeys.filter((k) => {
+          if (latestState[k] && k !== sessionKey) return false;
+          for (const [otherKey, otherRec] of Object.entries(latestState)) {
+            if (otherKey === sessionKey) continue;
+            if (otherRec && Array.isArray(otherRec.keys) && otherRec.keys.includes(k)) {
+              return false;
+            }
+          }
+          return true;
+        });
+
+        latestState[sessionKey] = {
+          convId: forceDeepNext ? null : (r.conversationId || convIdToUse || null),
+          model: modelUsed,
+          turns,
+          keys: mergedKeys,
+          syncedHashes,
+          numberedFloorCount,
+          swipeStreak: nextSwipeStreak,
+          dir: workspaceDir,
+          sysHead: prevRec.sysHead || resolved.sysHead,
+          updatedAt: Date.now(),
+          conversationMissing: false,
+        };
+        session.saveState(latestState);
+        out.finish(r.usage);
+
+        log('turn done(session)', {
+          key: sessionKey,
+          drift: drift.kind,
+          convId: latestState[sessionKey].convId,
+          turns,
+          forceDeepNext,
+          hasRecord: record !== null,
+          ...(isContinue ? { continue: true } : {}),
+          ms: Date.now() - t0,
+        });
+      }, { onPreempt: () => ac.abort() });
     } catch (e) {
       clearInterval(keepAlive);
       log('turn error:', e.message);
@@ -1036,4 +1108,4 @@ if (require.main !== module) {
   server.unref();
 }
 
-module.exports = { server, queue };
+module.exports = { server, queue, trySeedTimeline };

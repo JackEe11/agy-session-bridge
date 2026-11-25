@@ -37,6 +37,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
     const first = q.run('same', async () => {
       const cp = require('child_process');
+      // Windows 不能直接 spawn .js，测试桩这里按平台分派
       const child = process.platform === 'win32'
         ? cp.spawn(process.execPath, [FAKE], { env: { ...process.env } })
         : cp.spawn(FAKE, [], { env: { ...process.env } });

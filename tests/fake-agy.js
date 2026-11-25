@@ -10,12 +10,18 @@ function emit(o) { process.stdout.write(JSON.stringify(o) + '\n'); }
 let input = '';
 process.stdin.on('data', (c) => { input += c.toString('utf8'); });
 process.stdin.on('end', () => {
-  const mode = /slow/.test(input) ? 'slow'
+  const mode = /ignoreterm/.test(input) ? 'ignoreterm' : /slow/.test(input) ? 'slow'
     : /failhard/.test(input) ? 'failhard'
     : /failmid/.test(input) ? 'failmid'
     : /missing/.test(input) ? 'missing' : 'normal';
 
   if (mode === 'failhard') { process.exit(3); return; }
+  if (mode === 'ignoreterm') {
+    process.on('SIGTERM', () => {});
+    emit({ event: 'init', conversation_id: 'fake-ignoreterm', init: {} });
+    setTimeout(() => process.exit(0), 800);
+    return;
+  }
   if (mode === 'slow') { emit({ event: 'init', conversation_id: 'fake-slow', init: {} }); setTimeout(() => process.exit(0), 30000); return; }
   if (mode === 'failmid') {
     emit({ event: 'init', conversation_id: 'fake-failmid', init: {} });

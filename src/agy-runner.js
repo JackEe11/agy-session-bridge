@@ -1,14 +1,100 @@
 'use strict';
 
 const fs = require('fs');
-const { spawn } = require('child_process');
+const path = require('path');
+const cp = require('child_process');
+const { spawn } = cp;
 const { StringDecoder } = require('string_decoder');
 const config = require('./config');
 
-function checkMissingWarning(str) {
-  if (!str) return false;
-  const s = String(str).toLowerCase();
-  return s.includes('warning: conversation "') && s.includes('not found');
+const origChildKill = cp.ChildProcess && cp.ChildProcess.prototype
+  ? cp.ChildProcess.prototype.kill
+  : null;
+
+function rawKillChild(child, sig) {
+  if (!child) return false;
+  if (typeof child.__agyRawKill === 'function') {
+    return child.__agyRawKill(sig);
+  }
+  if (origChildKill) {
+    return origChildKill.call(child, sig);
+  }
+  if (typeof child.kill === 'function') {
+    return child.kill(sig);
+  }
+  return false;
+}
+
+/**
+ * 统一终止子进程：
+ * 1) 发送 SIGTERM
+ * 2) 起 3 秒定时器，若仍未 exit 则发送 SIGKILL
+ * 3) child exit/close 时清理定时器
+ */
+function terminateChild(child, graceMs = 3000) {
+  if (!child) return;
+  if (child.exitCode !== null && child.exitCode !== undefined) return;
+  if (child.signalCode !== null && child.signalCode !== undefined) return;
+
+  let exited = false;
+  const clearTimer = () => {
+    exited = true;
+    if (child.__agyKillTimer) {
+      clearTimeout(child.__agyKillTimer);
+      child.__agyKillTimer = null;
+    }
+  };
+
+  if (!child.__agyTermListenersAttached) {
+    child.__agyTermListenersAttached = true;
+    if (typeof child.once === 'function') {
+      child.once('exit', clearTimer);
+      child.once('close', clearTimer);
+    } else if (typeof child.on === 'function') {
+      child.on('exit', clearTimer);
+      child.on('close', clearTimer);
+    }
+  }
+
+  try {
+    rawKillChild(child, 'SIGTERM');
+  } catch {}
+
+  if (
+    exited ||
+    (child.exitCode !== null && child.exitCode !== undefined) ||
+    (child.signalCode !== null && child.signalCode !== undefined)
+  ) {
+    clearTimer();
+    return;
+  }
+
+  if (!child.__agyKillTimer) {
+    const waitMs = Number(graceMs) > 0 ? Number(graceMs) : 3000;
+    child.__agyKillTimer = setTimeout(() => {
+      child.__agyKillTimer = null;
+      if (
+        !exited &&
+        (child.exitCode === null || child.exitCode === undefined) &&
+        (child.signalCode === null || child.signalCode === undefined)
+      ) {
+        try {
+          rawKillChild(child, 'SIGKILL');
+        } catch {}
+      }
+    }, waitMs);
+  }
+}
+
+if (cp.ChildProcess && cp.ChildProcess.prototype && !cp.ChildProcess.prototype.__agyTerminateHooked) {
+  cp.ChildProcess.prototype.kill = function (sig) {
+    if (!sig || sig === 'SIGTERM') {
+      terminateChild(this);
+      return true;
+    }
+    return origChildKill.call(this, sig);
+  };
+  cp.ChildProcess.prototype.__agyTerminateHooked = true;
 }
 
 /**
@@ -25,6 +111,12 @@ function binSpec(bin, args = []) {
   return viaNode
     ? { cmd: process.execPath, args: [bin, ...args] }
     : { cmd: bin, args };
+}
+
+function checkMissingWarning(str) {
+  if (!str) return false;
+  const s = String(str).toLowerCase();
+  return s.includes('warning: conversation "') && s.includes('not found');
 }
 
 /**
@@ -80,13 +172,12 @@ function runTurn(opts = {}) {
       args.push('--effort', String(opts.effort));
     }
 
-    let cwd = opts.cwd || process.cwd();
-    if (opts.cwd) {
-      try {
-        fs.mkdirSync(opts.cwd, { recursive: true });
-      } catch {
-        cwd = process.cwd();
-      }
+    const defaultSysDir = path.join(config.WORKSPACES, '_sys');
+    let cwd = opts.cwd || defaultSysDir;
+    try {
+      fs.mkdirSync(cwd, { recursive: true });
+    } catch {
+      cwd = process.cwd();
     }
 
     const bin = process.env.AGY_BIN || config.AGY_BIN;
@@ -96,12 +187,10 @@ function runTurn(opts = {}) {
     }
 
     const spec = binSpec(bin, args);
-    const spawnCmd = spec.cmd;
-    const spawnArgs = spec.args;
 
     let child;
     try {
-      child = spawn(spawnCmd, spawnArgs, {
+      child = spawn(spec.cmd, spec.args, {
         cwd,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -125,10 +214,10 @@ function runTurn(opts = {}) {
     }
     if (opts.signal) {
       if (opts.signal.aborted) {
-        try { child.kill('SIGTERM'); } catch {}
+        terminateChild(child);
       } else {
         opts.signal.addEventListener('abort', () => {
-          try { child.kill('SIGTERM'); } catch {}
+          terminateChild(child);
         }, { once: true });
       }
     }
@@ -149,7 +238,7 @@ function runTurn(opts = {}) {
       conversationMissing = true;
       if (!missingNotified) {
         missingNotified = true;
-        try { child.kill('SIGTERM'); } catch {}
+        terminateChild(child);
         if (onMissing) {
           try { onMissing(); } catch {}
         }
@@ -158,7 +247,7 @@ function runTurn(opts = {}) {
 
     const timer = setTimeout(() => {
       timedOut = true;
-      try { child.kill('SIGKILL'); } catch {}
+      terminateChild(child);
     }, timeoutMs);
 
     function handleLine(rawLine) {
@@ -294,4 +383,4 @@ function runTurn(opts = {}) {
   });
 }
 
-module.exports = { runTurn, binSpec };
+module.exports = { runTurn, terminateChild, binSpec };

@@ -5,19 +5,36 @@ const path = require('path');
 
 const OPEN_TAG = '<ta_record>';
 const CLOSE_TAG = '</ta_record>';
-const HOLDBACK_BYTES = 24;
+const HOLDBACK = 24;
+
+const OPEN_RE = /((?:[ \t]*\r?\n)*[ \t]*```[a-zA-Z0-9_-]*[ \t]*(?:\r?\n[ \t]*)*)?<\s*ta_record\s*>/i;
+const CLOSE_TAG_RE = /<\/\s*ta_record\s*>/i;
+const TAIL_PENDING_RE = /(?:\r?\n[ \t]*)*```[a-zA-Z0-9_-]*[ \t]*(?:\r?\n[ \t]*)*(?:<\s*(?:t(?:a(?:_(?:r(?:e(?:c(?:o(?:r(?:d\s*)?)?)?)?)?)?)?)?)?)?$/i;
+const RECORD_BLOCK_RE = /(?:(?:[ \t]*\r?\n)*[ \t]*```[a-zA-Z0-9_-]*[ \t]*(?:\r?\n[ \t]*)*)?<\s*ta_record\s*>([\s\S]*?)<\/\s*ta_record\s*>(?:(?:[ \t]*\r?\n)*[ \t]*```[ \t]*(?:\r?\n)*)?/gi;
 
 function stripTrailingTagPrefix(s) {
   if (!s) return '';
-  const openPrefixIdx = s.indexOf('<ta_');
-  if (openPrefixIdx !== -1) {
-    return s.slice(0, openPrefixIdx);
+  const fencedOpenIdx = /(?:\r?\n[ \t]*)*```[a-zA-Z0-9_-]*[ \t]*(?:\r?\n[ \t]*)*<\s*ta_[\s\S]*$/i.exec(s);
+  if (fencedOpenIdx) {
+    return s.slice(0, fencedOpenIdx.index);
+  }
+  const openPrefixMatch = /<\s*ta_[\s\S]*$/i.exec(s);
+  if (openPrefixMatch) {
+    return s.slice(0, openPrefixMatch.index);
+  }
+  const fencedShortPrefix = /(?:\r?\n[ \t]*)*```[a-zA-Z0-9_-]*[ \t]*(?:\r?\n[ \t]*)*<\s*t?a?$/i.exec(s);
+  if (fencedShortPrefix) {
+    return s.slice(0, fencedShortPrefix.index);
   }
   for (let len = OPEN_TAG.length - 1; len >= 2; len--) {
     const prefix = OPEN_TAG.slice(0, len);
     if (s.endsWith(prefix)) {
       return s.slice(0, s.length - len);
     }
+  }
+  const shortTag = /<\s*t?a?$/i.exec(s);
+  if (shortTag) {
+    return s.slice(0, shortTag.index);
   }
   return s;
 }
@@ -47,21 +64,24 @@ function tailUtf8(str, maxBytes) {
 
 /**
  * 流式过滤器：把 <ta_record>...</ta_record> 从流里剥掉，返回可安全发送给酒馆的文本。
- * 必须能处理标签被拆到多个 delta 的情况（保留尾部 24 字节 holdback）。
+ * 必须能处理标签被拆到多个 delta 的情况（保留尾部 24 字符 holdback，防切裂 UTF-16 代理对）。
+ * 同时兼容普通、带空格 <ta_record >、以及 ``` 代码围栏包裹三种形态。
  */
 function recordFilter() {
   let buf = '';
-  let inRecord = false;
+  let state = 'TEXT'; // 'TEXT' | 'RECORD' | 'AFTER_RECORD'
+  let hadOpeningFence = false;
 
   function drain(isFlush) {
     let out = '';
     while (buf.length > 0) {
-      if (!inRecord) {
-        const openIdx = buf.indexOf(OPEN_TAG);
-        if (openIdx !== -1) {
-          out += buf.slice(0, openIdx);
-          buf = buf.slice(openIdx + OPEN_TAG.length);
-          inRecord = true;
+      if (state === 'TEXT') {
+        const openMatch = OPEN_RE.exec(buf);
+        if (openMatch) {
+          out += buf.slice(0, openMatch.index);
+          hadOpeningFence = Boolean(openMatch[1]);
+          buf = buf.slice(openMatch.index + openMatch[0].length);
+          state = 'RECORD';
           continue;
         }
         if (isFlush) {
@@ -69,34 +89,74 @@ function recordFilter() {
           buf = '';
           break;
         }
-        const totalBytes = Buffer.byteLength(buf, 'utf8');
-        if (totalBytes <= HOLDBACK_BYTES) {
+        if (buf.length <= HOLDBACK) {
           break;
         }
-        const safeFront = truncateUtf8(buf, totalBytes - HOLDBACK_BYTES);
-        if (!safeFront) {
+        let cut = buf.length - HOLDBACK;
+        const pendingFence = TAIL_PENDING_RE.exec(buf);
+        if (pendingFence && pendingFence.index < cut) {
+          cut = pendingFence.index;
+        }
+        if (cut > 0 && cut < buf.length) {
+          const c = buf.charCodeAt(cut);
+          if (c >= 0xDC00 && c <= 0xDFFF) cut -= 1; // 落在低代理项 → 回退一位
+        }
+        if (cut <= 0) {
           break;
         }
-        out += safeFront;
-        buf = buf.slice(safeFront.length);
+        out += buf.slice(0, cut);
+        buf = buf.slice(cut);
         break;
-      } else {
-        const closeIdx = buf.indexOf(CLOSE_TAG);
-        if (closeIdx !== -1) {
-          buf = buf.slice(closeIdx + CLOSE_TAG.length);
-          inRecord = false;
+      } else if (state === 'RECORD') {
+        const closeMatch = CLOSE_TAG_RE.exec(buf);
+        if (closeMatch) {
+          buf = buf.slice(closeMatch.index + closeMatch[0].length);
+          state = hadOpeningFence ? 'AFTER_RECORD' : 'TEXT';
           continue;
         }
         if (isFlush) {
           buf = '';
-          inRecord = false;
+          state = 'TEXT';
+          hadOpeningFence = false;
           break;
         }
-        const totalBytes = Buffer.byteLength(buf, 'utf8');
-        if (totalBytes > HOLDBACK_BYTES) {
-          buf = tailUtf8(buf, HOLDBACK_BYTES);
+        if (buf.length > HOLDBACK) {
+          let keep = buf.length - HOLDBACK;
+          if (keep > 0 && keep < buf.length) {
+            const c = buf.charCodeAt(keep);
+            if (c >= 0xDC00 && c <= 0xDFFF) keep -= 1;
+          }
+          buf = buf.slice(keep);
         }
         break;
+      } else {
+        // state === 'AFTER_RECORD': strip closing ``` fence and any trailing blank lines
+        const fenceDone = /^(?:[ \t]*\r?\n)*[ \t]*```[ \t]*(?:\r?\n)+/.exec(buf);
+        if (fenceDone) {
+          buf = buf.slice(fenceDone[0].length);
+          state = 'TEXT';
+          hadOpeningFence = false;
+          continue;
+        }
+        const fenceFollowedByText = /^((?:[ \t]*\r?\n)*[ \t]*```[ \t]*)[^\s`]/.exec(buf);
+        if (fenceFollowedByText) {
+          buf = buf.slice(fenceFollowedByText[1].length);
+          state = 'TEXT';
+          hadOpeningFence = false;
+          continue;
+        }
+        if (isFlush) {
+          buf = buf.replace(/^(?:[ \t]*\r?\n)*[ \t]*```[ \t]*(?:\r?\n)*/, '');
+          state = 'TEXT';
+          hadOpeningFence = false;
+          continue;
+        }
+        const couldBeClosingFence = /^(?:[ \t]*\r?\n)*[ \t]*(?:`{1,3}[ \t]*\r?\n?)?$/.test(buf);
+        if (couldBeClosingFence) {
+          break;
+        }
+        state = 'TEXT';
+        hadOpeningFence = false;
       }
     }
     return out;
@@ -121,15 +181,20 @@ function recordFilter() {
 function extractRecord(text) {
   const src = typeof text === 'string' ? text : String(text || '');
   const records = [];
-  const re = /<ta_record>([\s\S]*?)<\/ta_record>/g;
+  RECORD_BLOCK_RE.lastIndex = 0;
   let m;
-  while ((m = re.exec(src)) !== null) {
-    records.push(m[1].trim());
+  while ((m = RECORD_BLOCK_RE.exec(src)) !== null) {
+    const inner = m[1].trim().replace(/^```[a-zA-Z0-9_-]*\s*([\s\S]*?)\s*```$/, '$1').trim();
+    records.push(inner);
   }
   if (records.length === 0) {
     return { clean: src, record: null };
   }
-  const clean = src.replace(/<ta_record>[\s\S]*?<\/ta_record>/g, '').trim();
+  RECORD_BLOCK_RE.lastIndex = 0;
+  const clean = src
+    .replace(RECORD_BLOCK_RE, '')
+    .replace(/(?:[ \t]*\r?\n)*[ \t]*```[a-zA-Z0-9_-]*[ \t]*\r?\n?[ \t]*```[ \t]*(?:\r?\n)*/g, '')
+    .trim();
   return {
     clean,
     record: records.join('\n').trim(),
@@ -187,9 +252,10 @@ function upsertFloor(timelinePath, floor, record) {
 /**
  * @param {string} timelinePath
  * @param {number} maxBytes
+ * @param {number} [maxFloor]
  * @returns {string}
  */
-function readTimeline(timelinePath, maxBytes) {
+function readTimeline(timelinePath, maxBytes, maxFloor) {
   if (!timelinePath) return '';
   let raw = '';
   try {
@@ -199,14 +265,25 @@ function readTimeline(timelinePath, maxBytes) {
     return '';
   }
   if (!raw) return '';
+
+  const hasMaxFloor = maxFloor !== undefined && maxFloor !== null && Number.isFinite(Number(maxFloor));
+  const floorCap = hasMaxFloor ? Number(maxFloor) : Infinity;
   const limit = Number(maxBytes);
-  if (!limit || limit <= 0 || Buffer.byteLength(raw, 'utf8') <= limit) {
+
+  if (!hasMaxFloor && (!limit || limit <= 0 || Buffer.byteLength(raw, 'utf8') <= limit)) {
     return raw;
   }
 
-  const segments = parseTimelineSegments(raw);
-  if (segments.length === 0) {
+  let segments = parseTimelineSegments(raw);
+  if (hasMaxFloor) {
+    segments = segments.filter((s) => s.floor < floorCap);
+    if (segments.length === 0) return '';
+  } else if (segments.length === 0) {
     return tailUtf8(raw, limit);
+  }
+
+  if (!limit || limit <= 0) {
+    return segments.map((s) => `<!-- floor: ${s.floor} -->\n${s.body}`).join('\n\n');
   }
 
   const picked = [];
@@ -226,7 +303,8 @@ function readTimeline(timelinePath, maxBytes) {
   }
 
   if (picked.length === 0) {
-    return tailUtf8(raw, limit);
+    const lastFormatted = `<!-- floor: ${segments[segments.length - 1].floor} -->\n${segments[segments.length - 1].body}`;
+    return tailUtf8(lastFormatted, limit);
   }
   const joined = picked.join('\n\n');
   return Buffer.byteLength(joined, 'utf8') <= limit ? joined : truncateUtf8(joined, limit);
