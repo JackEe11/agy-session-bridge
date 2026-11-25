@@ -78,9 +78,16 @@ function runTurn(opts = {}) {
       env.AGY_CLI_AUTO_COMPACT_OVERRIDE = config.COMPACT_OVERRIDE;
     }
 
+    // Windows 不能直接 spawn 一个 .js 文件，即使它带 shebang。
+    // 官方 agy 是原生可执行文件，不受影响；这条分支只服务于「用脚本冒充 CLI」
+    // 的场合（测试桩、Windows 上的本地开发）。
+    const viaNode = process.platform === 'win32' && /\.(c|m)?js$/i.test(bin);
+    const spawnCmd = viaNode ? process.execPath : bin;
+    const spawnArgs = viaNode ? [bin, ...args] : args;
+
     let child;
     try {
-      child = spawn(bin, args, {
+      child = spawn(spawnCmd, spawnArgs, {
         cwd,
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
