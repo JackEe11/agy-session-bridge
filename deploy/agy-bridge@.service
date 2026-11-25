@@ -1,0 +1,31 @@
+[Unit]
+Description=agy-session-bridge — Antigravity CLI as an OpenAI-compatible long-memory backend
+After=network.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/opt/agy-session-bridge
+Environment=HOME=/home/%i
+Environment=AGY_SESSION_MODE=1
+
+# 可选：按需覆盖
+# Environment=AGY_BIN=/home/%i/.local/bin/agy
+# Environment=AGY_DEFAULT_MODEL=gemini-4-argon-high
+# Environment=AGY_PROMPT_BUDGET=170000
+# Environment=AGY_MAX_CONCURRENT=1
+# Environment=AGY_COMPACT_OVERRIDE=60%
+
+ExecStart=/usr/bin/node /opt/agy-session-bridge/src/server.js
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# 本服务只监听回环地址；如需对外暴露，请自行加 TLS 与鉴权
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

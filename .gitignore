@@ -1,0 +1,22 @@
+# 运行时产生的数据
+*.log
+sessions.json
+summaries.json
+chats/
+workspaces/
+logs/
+
+# 令牌与本地配置
+token
+.env
+.agy-bridge/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# 编辑器 / 系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
