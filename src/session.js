@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const config = require('./config');
 
 const memoryStateByFile = new Map();
+let seq = 0;
 
 function textOf(content) {
   if (typeof content === 'string') return content;
@@ -136,24 +137,46 @@ function findBySingleKey(state, targetKey) {
 }
 
 /**
- * 查询时先查 primary，再查 alias；
- * 若通过 alias 命中且记录只有 primary，则把 alias 补进记录的 keys 数组。
+ * 查询时先查 alias，再查 primary（仅当实际非 system 消息数 < 2 时才走 primary）；
+ * 命中后可把属于本会话的另一个键补进 keys 数组，但不把一个存档的键塞进另一个已存在记录的 keys 里。
  */
 function resolveSession(state, messages) {
-  const safeState = (state && typeof state === 'object') ? state : {};
-  const { sysText, sys1KB, nonSysMsgs } = extractKeyParts(messages);
+  const safeState = (state && typeof state === 'object' && !Array.isArray(state)) ? state : {};
+  const { sysText, sys1KB, first, nonSysMsgs } = extractKeyParts(messages);
   const primary = chatKey(messages);
   const alias = aliasKey(messages);
+  const initAlias = crypto
+    .createHash('sha256')
+    .update(sys1KB + '\0' + first + '\0__INIT__', 'utf8')
+    .digest('hex')
+    .slice(0, 16);
 
-  let hit = findBySingleKey(safeState, primary);
-  let hitBy = hit ? 'primary' : null;
+  let hit = findBySingleKey(safeState, alias);
+  let hitBy = hit ? 'alias' : null;
 
-  if (!hit) {
-    hit = findBySingleKey(safeState, alias);
-    if (hit) hitBy = 'alias';
+  if (!hit && nonSysMsgs.length < 2) {
+    hit = findBySingleKey(safeState, primary);
+    if (hit) hitBy = 'primary';
   }
 
-  // 若原 system 不足 1KB，两轮之间插入世界书使 system 变长，按已同步对话层与初始 system 片段兜底匹配同一会话
+  // 若会话首轮仅 1 条非 system 消息（当时仅登记了 primary / initAlias），第 2 轮起推进至 >=2 条消息时衔接同一会话
+  if (!hit && nonSysMsgs.length >= 2) {
+    const pHit = findBySingleKey(safeState, primary);
+    if (pHit && pHit.sess) {
+      const recKeys = Array.isArray(pHit.sess.keys) ? pHit.sess.keys : [pHit.key];
+      const hasCommittedSecond = recKeys.some((k) => k !== primary && k !== initAlias);
+      if (!hasCommittedSecond) {
+        const hashes = nonSysMsgs.map(layerHash);
+        const synced = Array.isArray(pHit.sess.syncedHashes) ? pHit.sess.syncedHashes : [];
+        if (synced.length < 2 || (synced[0] === hashes[0] && synced[1] === hashes[1])) {
+          hit = pHit;
+          hitBy = 'primary';
+        }
+      }
+    }
+  }
+
+  // 若原 system 不足 1KB，两轮之间插入世界书使 system 变长，按已同步的前两层对话层与初始 system 片段兜底匹配同一会话
   if (!hit && nonSysMsgs.length > 0) {
     const hashes = nonSysMsgs.map(layerHash);
     for (const [k, rec] of Object.entries(safeState)) {
@@ -161,11 +184,19 @@ function resolveSession(state, messages) {
         continue;
       }
       if (rec.syncedHashes[0] !== hashes[0]) continue;
-      const twoLayerMatch = hashes.length >= 2 && rec.syncedHashes.length >= 2 && rec.syncedHashes[1] === hashes[1];
-      const sysGrowMatch = typeof rec.sysHead === 'string' && rec.sysHead.length > 0 && sysText.includes(rec.sysHead);
-      if (twoLayerMatch || sysGrowMatch) {
+      if (hashes.length >= 2 && rec.syncedHashes.length >= 2) {
+        if (rec.syncedHashes[1] === hashes[1]) {
+          hit = { key: k, sess: rec };
+          hitBy = 'alias';
+          break;
+        }
+        continue;
+      }
+      const sysGrowMatch = hashes.length < 2 && rec.syncedHashes.length < 2
+        && typeof rec.sysHead === 'string' && rec.sysHead.length > 0 && sysText.includes(rec.sysHead);
+      if (sysGrowMatch) {
         hit = { key: k, sess: rec };
-        hitBy = 'alias';
+        hitBy = 'primary';
         break;
       }
     }
@@ -175,10 +206,12 @@ function resolveSession(state, messages) {
     if (!Array.isArray(hit.sess.keys)) {
       hit.sess.keys = [hit.key];
     }
-    if (!hit.sess.keys.includes(primary)) {
+    const pOwner = findBySingleKey(safeState, primary);
+    if ((!pOwner || pOwner.sess === hit.sess) && !hit.sess.keys.includes(primary)) {
       hit.sess.keys.push(primary);
     }
-    if (!hit.sess.keys.includes(alias)) {
+    const aOwner = findBySingleKey(safeState, alias);
+    if ((!aOwner || aOwner.sess === hit.sess) && !hit.sess.keys.includes(alias)) {
       hit.sess.keys.push(alias);
     }
     return {
@@ -189,6 +222,20 @@ function resolveSession(state, messages) {
       keys: hit.sess.keys,
       hitBy,
       sysHead: hit.sess.sysHead || truncateUtf8(sys1KB, 64),
+    };
+  }
+
+  const primaryTaken = Boolean(findBySingleKey(safeState, primary));
+  if (primaryTaken || nonSysMsgs.length >= 2) {
+    const keys = primaryTaken ? [alias] : (primary === alias ? [alias] : [alias, primary]);
+    return {
+      key: alias,
+      sess: null,
+      primary,
+      alias,
+      keys,
+      hitBy: null,
+      sysHead: truncateUtf8(sys1KB, 64),
     };
   }
 
@@ -209,12 +256,13 @@ function loadState() {
   try {
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object') {
-      memoryStateByFile.set(file, parsed);
-      return parsed;
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      memoryStateByFile.set(file, JSON.parse(JSON.stringify(parsed)));
+      return JSON.parse(JSON.stringify(parsed));
     }
+    return {};
   } catch {
-    if (memoryStateByFile.has(file)) {
+    if (!fs.existsSync(file) && memoryStateByFile.has(file)) {
       return JSON.parse(JSON.stringify(memoryStateByFile.get(file)));
     }
   }
@@ -223,11 +271,11 @@ function loadState() {
 
 function saveState(state) {
   const file = config.STATE_FILE;
-  const safeState = (state && typeof state === 'object') ? state : {};
+  const safeState = (state && typeof state === 'object' && !Array.isArray(state)) ? state : {};
   memoryStateByFile.set(file, JSON.parse(JSON.stringify(safeState)));
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const tmp = `${file}.tmp.${process.pid}`;
+    const tmp = `${file}.tmp.${process.pid}.${++seq}`;
     fs.writeFileSync(tmp, JSON.stringify(safeState, null, 2), 'utf8');
     fs.renameSync(tmp, file);
   } catch {
@@ -238,18 +286,16 @@ function saveState(state) {
 }
 
 /**
- * 无 sess → deep；消息层哈希与 syncedHashes 前缀一致且只多 1 条 → advance；
- * 首个不一致下标 divIdx，深度 = syncedHashes.length - divIdx；深度<=4 且 swipeStreak<3 → shallow；否则 deep
+ * 四态漂移判定：
+ * - 全部哈希相等且长度相等 → { kind: 'retry', divIdx }
+ * - 前缀一致且 hashes.length > synced.length → { kind: 'advance', divIdx }
+ * - divIdx === hashes.length && hashes.length < synced.length（纯回滚）→ { kind: 'deep', divIdx }
+ * - 首个不一致 divIdx，深度 synced.length - divIdx：
+ *   depth <= MAX_DRIFT_FLOORS && swipeStreak < MAX_SWIPE_STREAK → shallow，否则 deep
  */
 function driftOf(sess, messages) {
   const list = Array.isArray(messages) ? messages : [];
   if (!sess || typeof sess !== 'object') {
-    return { kind: 'deep', divIdx: 0 };
-  }
-  if (('convId' in sess && !sess.convId) || sess.conversationMissing) {
-    return { kind: 'deep', divIdx: 0 };
-  }
-  if (typeof sess.turns === 'number' && sess.turns >= config.MAX_TURNS_PER_SESSION) {
     return { kind: 'deep', divIdx: 0 };
   }
   const synced = Array.isArray(sess.syncedHashes) ? sess.syncedHashes : [];
@@ -269,8 +315,23 @@ function driftOf(sess, messages) {
     divIdx++;
   }
 
-  if (divIdx === synced.length && hashes.length === synced.length + 1) {
+  if (('convId' in sess && !sess.convId) || sess.conversationMissing) {
+    return { kind: 'deep', divIdx };
+  }
+  if (typeof sess.turns === 'number' && sess.turns >= config.MAX_TURNS_PER_SESSION) {
+    return { kind: 'deep', divIdx };
+  }
+
+  if (divIdx === synced.length && hashes.length === synced.length) {
+    return { kind: 'retry', divIdx };
+  }
+
+  if (divIdx === synced.length && hashes.length > synced.length) {
     return { kind: 'advance', divIdx };
+  }
+
+  if (divIdx === hashes.length && hashes.length < synced.length) {
+    return { kind: 'deep', divIdx };
   }
 
   const depth = synced.length - divIdx;

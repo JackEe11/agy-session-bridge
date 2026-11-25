@@ -188,6 +188,7 @@ function pickFallback(model, errText) {
 }
 
 function sseChunk(res, model, delta, finish) {
+  if (res.writableEnded || res.destroyed) return;
   const payload = {
     id: 'chatcmpl-' + crypto.randomBytes(6).toString('hex'),
     object: 'chat.completion.chunk',
@@ -199,6 +200,7 @@ function sseChunk(res, model, delta, finish) {
 }
 
 function sendSseError(res, model, headersSent, errMsg) {
+  if (res.writableEnded || res.destroyed) return;
   const m = model || config.DEFAULT_MODEL;
   if (!headersSent && !res.headersSent) {
     res.writeHead(200, {
@@ -209,8 +211,10 @@ function sendSseError(res, model, headersSent, errMsg) {
     sseChunk(res, m, { role: 'assistant', content: '' }, null);
   }
   sseChunk(res, m, { content: '\n[桥接错误] ' + String(errMsg || 'unknown error') }, 'stop');
-  res.write('data: [DONE]\n\n');
-  res.end();
+  if (!res.writableEnded && !res.destroyed) {
+    res.write('data: [DONE]\n\n');
+    res.end();
+  }
 }
 
 /* ---- v4 Stateless Mode compatibility ---- */
@@ -387,14 +391,6 @@ const server = http.createServer((req, res) => {
     }));
   }
 
-  if (req.method === 'GET' && url === '/quota') {
-    runQuota().then((q) => {
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: q.parsed.length > 0, remaining: q.parsed, raw: q.text }, null, 2));
-    });
-    return;
-  }
-
   const remote = (req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : '').replace('::ffff:', '');
   const isLoopback = !remote || remote === '127.0.0.1' || remote === '::1';
   if (AUTH_TOKEN && !isLoopback) {
@@ -403,6 +399,31 @@ const server = http.createServer((req, res) => {
       res.writeHead(401, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: 'invalid api key', type: 'invalid_request_error' } }));
     }
+  }
+
+  if (req.method === 'GET' && url === '/quota') {
+    const quotaTimer = setTimeout(() => {
+      if (!res.writableEnded) {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+          .end(JSON.stringify({ ok: false, error: 'quota timeout after 60s' }));
+      }
+    }, 60000);
+    runQuota()
+      .then((q) => {
+        clearTimeout(quotaTimer);
+        if (!res.writableEnded) {
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: q.parsed.length > 0, remaining: q.parsed, raw: q.text }, null, 2));
+        }
+      })
+      .catch((err) => {
+        clearTimeout(quotaTimer);
+        if (!res.writableEnded) {
+          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+            .end(JSON.stringify({ ok: false, error: String(err && err.message ? err.message : err) }));
+        }
+      });
+    return;
   }
 
   if (req.method === 'GET' && (url === '/v1/models' || url === '/models')) {
@@ -424,6 +445,11 @@ const server = http.createServer((req, res) => {
     res.writeHead(404, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ error: { message: 'not found' } }));
   }
+
+  const ac = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) ac.abort();
+  });
 
   let raw = '';
   req.on('data', (c) => { raw += c.toString('utf8'); });
@@ -452,13 +478,19 @@ const server = http.createServer((req, res) => {
     const nonSys = messages.filter((m) => m && m.role !== 'system' && m.role !== 'developer');
     const key = session.chatKey(messages);
 
-    res.writeHead(200, {
-      'content-type': 'text/event-stream; charset=utf-8',
-      'cache-control': 'no-cache',
-      connection: 'keep-alive',
-    });
-    sseChunk(res, model, { role: 'assistant', content: '' }, null);
+    if (!res.writableEnded && !res.destroyed) {
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-cache',
+        connection: 'keep-alive',
+      });
+      sseChunk(res, model, { role: 'assistant', content: '' }, null);
+    }
     const keepAlive = setInterval(() => {
+      if (res.writableEnded || res.destroyed) {
+        clearInterval(keepAlive);
+        return;
+      }
       try { res.write(': keep-alive\n\n'); } catch {}
     }, 5000);
 
@@ -479,12 +511,14 @@ const server = http.createServer((req, res) => {
             prompt,
             model: modelUsed,
             effort,
+            signal: ac.signal,
             onDelta: (delta) => {
+              if (res.writableEnded || res.destroyed) return;
               sentCount += delta.length;
               sseChunk(res, modelUsed, { content: delta }, null);
             },
           });
-          if (resTurn.code !== 0 && !resTurn.text && sentCount === 0) {
+          if (resTurn.code !== 0 && !resTurn.text && sentCount === 0 && !ac.signal.aborted) {
             const fb = pickFallback(modelUsed, resTurn.stderr);
             if (fb) {
               log('fallback(stateless)', { from: modelUsed, to: fb });
@@ -493,7 +527,9 @@ const server = http.createServer((req, res) => {
                 prompt,
                 model: modelUsed,
                 effort,
+                signal: ac.signal,
                 onDelta: (delta) => {
+                  if (res.writableEnded || res.destroyed) return;
                   sentCount += delta.length;
                   sseChunk(res, modelUsed, { content: delta }, null);
                 },
@@ -504,15 +540,19 @@ const server = http.createServer((req, res) => {
         });
 
         clearInterval(keepAlive);
-        if (r.code !== 0 && !r.text) {
+        if (r.code !== 0 && !r.text && !ac.signal.aborted) {
           throw new Error(r.stderr || `agy exited with code ${r.code}`);
         }
         if (r.text && sentCount === 0) {
           sseChunk(res, modelUsed, { content: r.text }, null);
         }
-        sseChunk(res, modelUsed, {}, 'stop');
-        res.write('data: [DONE]\n\n');
-        res.end();
+        if (!res.writableEnded && !res.destroyed) {
+          sseChunk(res, modelUsed, {}, 'stop');
+          if (!res.writableEnded && !res.destroyed) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+        }
         log('turn done(stateless)', { key, ms: Date.now() - t0, chars: (r.text || '').length, modelUsed });
         return;
       }
@@ -523,7 +563,10 @@ const server = http.createServer((req, res) => {
       const sessionKey = resolved.key;
       const rawSess = resolved.sess;
       const effectiveSess = getEffectiveSession(rawSess);
-      const drift = session.driftOf(effectiveSess, nonSys);
+      const sessForDrift = rawSess
+        ? { ...rawSess, convId: effectiveSess ? effectiveSess.convId : null }
+        : null;
+      const drift = session.driftOf(sessForDrift, nonSys);
 
       const workspaceDir = (rawSess && rawSess.dir) ? rawSess.dir : path.join(config.WORKSPACES, sessionKey);
       const timelinePath = path.join(workspaceDir, 'timeline.md');
@@ -534,15 +577,24 @@ const server = http.createServer((req, res) => {
       let prompt = '';
       let convIdToUse = null;
       let nextSwipeStreak = 0;
+      let isContinue = false;
 
-      if (drift.kind === 'advance') {
-        const lastUser = [...nonSys].reverse().find((m) => m && m.role === 'user') || nonSys[nonSys.length - 1];
-        prompt = lastUser ? textOf(lastUser.content) : '';
-        if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
-          prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
+      if (drift.kind === 'advance' || drift.kind === 'retry') {
+        const lastMsg = nonSys[nonSys.length - 1];
+        if (lastMsg && lastMsg.role === 'assistant') {
+          prompt = '请顺着你上一段回复继续写下去，不要重写已经写过的内容，不要复述。';
+          isContinue = true;
+        } else {
+          const lastUser = [...nonSys].reverse().find((m) => m && m.role === 'user') || lastMsg;
+          prompt = lastUser ? textOf(lastUser.content) : '';
+          if (Buffer.byteLength(prompt, 'utf8') > config.PROMPT_BUDGET) {
+            prompt = tailUtf8(prompt, config.PROMPT_BUDGET);
+          }
         }
         convIdToUse = effectiveSess.convId;
-        nextSwipeStreak = 0;
+        nextSwipeStreak = drift.kind === 'retry'
+          ? ((effectiveSess && typeof effectiveSess.swipeStreak === 'number') ? effectiveSess.swipeStreak : 0)
+          : 0;
       } else if (drift.kind === 'shallow') {
         prompt = session.buildOverride({ divIdx: drift.divIdx, messages: nonSys });
         convIdToUse = effectiveSess.convId;
@@ -567,80 +619,134 @@ const server = http.createServer((req, res) => {
         model,
         promptBytes: Buffer.byteLength(prompt, 'utf8'),
         floors: nonSys.length,
+        ...(isContinue ? { continue: true } : {}),
       });
 
       // 4 & 5. Run through TurnQueue and stream filtered deltas via recordFilter
       let modelUsed = model;
       let filter = archive.recordFilter();
       let rawDeltaCount = 0;
+      let streamedText = '';
+      let rebuiltInRequest = false;
+
+      const executeTurn = (turnPrompt, turnConvId) => runTurn({
+        prompt: turnPrompt,
+        model: modelUsed,
+        conversationId: turnConvId,
+        effort,
+        addDirs: [workspaceDir],
+        cwd: workspaceDir,
+        timeoutMs: config.TURN_TIMEOUT_MS,
+        signal: ac.signal,
+        onDelta: (delta) => {
+          if (res.writableEnded || res.destroyed) return;
+          rawDeltaCount += delta.length;
+          const safe = filter.push(delta);
+          if (safe) {
+            streamedText += safe;
+            sseChunk(res, modelUsed, { content: safe }, null);
+          }
+        },
+      });
 
       const r = await queue.run(sessionKey, async () => {
-        let resTurn = await runTurn({
-          prompt,
-          model: modelUsed,
-          conversationId: convIdToUse,
-          effort,
-          addDirs: [workspaceDir],
-          cwd: workspaceDir,
-          timeoutMs: config.TURN_TIMEOUT_MS,
-          onDelta: (delta) => {
-            rawDeltaCount += delta.length;
-            const safe = filter.push(delta);
-            if (safe) {
-              sseChunk(res, modelUsed, { content: safe }, null);
-            }
-          },
-        });
+        let resTurn = await executeTurn(prompt, convIdToUse);
 
-        if (resTurn.code !== 0 && !resTurn.text && rawDeltaCount === 0) {
+        if (resTurn.conversationMissing && !ac.signal.aborted) {
+          const timeline = archive.readTimeline(timelinePath, Math.floor(config.PROMPT_BUDGET * 0.2));
+          prompt = session.buildBootstrap({
+            system: sysText,
+            messages: nonSys,
+            timeline,
+            budgetBytes: config.PROMPT_BUDGET,
+          });
+          convIdToUse = null;
+          nextSwipeStreak = 0;
+          rebuiltInRequest = true;
+          filter = archive.recordFilter();
+          rawDeltaCount = 0;
+          streamedText = '';
+          log('rebuild on conversationMissing(session)', { key: sessionKey, model: modelUsed });
+          resTurn = await executeTurn(prompt, null);
+        }
+
+        if (resTurn.code !== 0 && !resTurn.text && rawDeltaCount === 0 && !ac.signal.aborted) {
           const fb = pickFallback(modelUsed, resTurn.stderr);
           if (fb) {
             log('fallback(session)', { key: sessionKey, from: modelUsed, to: fb });
             modelUsed = fb;
             filter = archive.recordFilter();
-            resTurn = await runTurn({
-              prompt,
-              model: modelUsed,
-              conversationId: convIdToUse,
-              effort,
-              addDirs: [workspaceDir],
-              cwd: workspaceDir,
-              timeoutMs: config.TURN_TIMEOUT_MS,
-              onDelta: (delta) => {
-                rawDeltaCount += delta.length;
-                const safe = filter.push(delta);
-                if (safe) {
-                  sseChunk(res, modelUsed, { content: safe }, null);
-                }
-              },
-            });
+            rawDeltaCount = 0;
+            streamedText = '';
+            resTurn = await executeTurn(prompt, convIdToUse);
           }
         }
         return resTurn;
       });
 
       clearInterval(keepAlive);
+      const aborted = ac.signal.aborted || res.writableEnded || res.destroyed;
 
-      if (r.code !== 0 && !r.text) {
-        throw new Error(r.stderr || `agy exited with code ${r.code}`);
+      if (!aborted && (r.conversationMissing || (r.code !== 0 && !r.text && rawDeltaCount === 0))) {
+        const reason = r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`;
+        log('turn done(session)', {
+          key: sessionKey,
+          drift: drift.kind,
+          stateCommit: false,
+          reason,
+          code: r.code,
+          ms: Date.now() - t0,
+        });
+        throw new Error(r.stderr || (r.conversationMissing ? 'conversation missing after rebuild' : `agy exited with code ${r.code}`));
       }
 
       if (rawDeltaCount === 0 && r.text) {
         const pushed = filter.push(r.text);
-        if (pushed) sseChunk(res, modelUsed, { content: pushed }, null);
+        if (pushed) {
+          streamedText += pushed;
+          sseChunk(res, modelUsed, { content: pushed }, null);
+        }
       }
       const tail = filter.flush();
       if (tail) {
+        streamedText += tail;
         sseChunk(res, modelUsed, { content: tail }, null);
       }
 
-      sseChunk(res, modelUsed, {}, 'stop');
-      res.write('data: [DONE]\n\n');
-      res.end();
+      if (!res.writableEnded && !res.destroyed) {
+        sseChunk(res, modelUsed, {}, 'stop');
+        if (!res.writableEnded && !res.destroyed) {
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
+      }
 
-      // 6 & 7. Extract <ta_record>, persist timeline.md, and update session state
-      const { clean, record } = archive.extractRecord(r.text || '');
+      // 6 & 7. Only commit state when r.code === 0 && !aborted && !r.conversationMissing
+      const canCommit = r.code === 0 && !aborted && !ac.signal.aborted && !r.conversationMissing;
+      if (!canCommit) {
+        const reason = (aborted || ac.signal.aborted)
+          ? 'aborted'
+          : (r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`);
+        log('turn done(session)', {
+          key: sessionKey,
+          drift: drift.kind,
+          stateCommit: false,
+          reason,
+          code: r.code,
+          ms: Date.now() - t0,
+        });
+        return;
+      }
+
+      const { record } = archive.extractRecord(r.text || '');
       const currentFloor = nonSys.length;
+      if (drift.kind === 'deep') {
+        try {
+          archive.upsertFloor(timelinePath, drift.divIdx, '');
+        } catch (err) {
+          log('upsertFloor error:', err.message);
+        }
+      }
       if (record !== null || drift.kind === 'shallow') {
         try {
           archive.upsertFloor(timelinePath, currentFloor, record || '');
@@ -650,20 +756,32 @@ const server = http.createServer((req, res) => {
       }
 
       const syncedHashes = nonSys.map(session.layerHash);
-      syncedHashes.push(session.layerHash({ role: 'assistant', content: clean }));
+      syncedHashes.push(session.layerHash({ role: 'assistant', content: streamedText }));
 
-      const prevTurns = (drift.kind === 'deep' || !effectiveSess) ? 0 : (effectiveSess.turns || 0);
-      const turns = prevTurns + 1;
-      const forceDeepNext = Boolean(r.conversationMissing) || turns >= config.MAX_TURNS_PER_SESSION;
+      const prevTurns = (drift.kind === 'deep' || rebuiltInRequest || !effectiveSess) ? 0 : (effectiveSess.turns || 0);
+      const turns = drift.kind === 'retry' ? Math.max(1, prevTurns) : prevTurns + 1;
+      const forceDeepNext = turns >= config.MAX_TURNS_PER_SESSION;
 
+      const postTurnAlias = nonSys.length === 1
+        ? session.aliasKey([...messages, { role: 'assistant', content: streamedText }])
+        : null;
       const latestState = session.loadState();
       const prevRec = latestState[sessionKey] || rawSess || {};
-      const mergedKeys = Array.from(new Set([
+      const candidateKeys = Array.from(new Set([
         ...(Array.isArray(prevRec.keys) ? prevRec.keys : []),
         ...(Array.isArray(resolved.keys) ? resolved.keys : []),
-        resolved.primary,
-        resolved.alias,
+        postTurnAlias,
       ].filter(Boolean)));
+      const mergedKeys = candidateKeys.filter((k) => {
+        if (latestState[k] && k !== sessionKey) return false;
+        for (const [otherKey, otherRec] of Object.entries(latestState)) {
+          if (otherKey === sessionKey) continue;
+          if (otherRec && Array.isArray(otherRec.keys) && otherRec.keys.includes(k)) {
+            return false;
+          }
+        }
+        return true;
+      });
 
       latestState[sessionKey] = {
         convId: forceDeepNext ? null : (r.conversationId || convIdToUse || null),
@@ -675,7 +793,7 @@ const server = http.createServer((req, res) => {
         dir: workspaceDir,
         sysHead: prevRec.sysHead || resolved.sysHead,
         updatedAt: Date.now(),
-        conversationMissing: Boolean(r.conversationMissing),
+        conversationMissing: false,
       };
       session.saveState(latestState);
 
@@ -686,6 +804,7 @@ const server = http.createServer((req, res) => {
         turns,
         forceDeepNext,
         hasRecord: record !== null,
+        ...(isContinue ? { continue: true } : {}),
         ms: Date.now() - t0,
       });
     } catch (e) {

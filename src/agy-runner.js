@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const { spawn } = require('child_process');
+const { StringDecoder } = require('string_decoder');
 const config = require('./config');
 
 function checkMissingWarning(str) {
@@ -41,6 +42,7 @@ function runTurn(opts = {}) {
     const timeoutSec = Math.max(1, Math.ceil(timeoutMs / 1000));
     const onDelta = typeof opts.onDelta === 'function' ? opts.onDelta : null;
 
+    // 刻意不传 -p：当前依靠管道 stdin 隐式进入 print 模式，保持现状以兼容长 prompt 管道输入
     const args = [
       '--output-format', 'stream-json',
       '--print-timeout', `${timeoutSec}s`,
@@ -71,11 +73,16 @@ function runTurn(opts = {}) {
     }
 
     const bin = process.env.AGY_BIN || config.AGY_BIN;
+    const env = { ...process.env, HOME: config.HOME, ELECTRON_RUN_AS_NODE: '' };
+    if (config.COMPACT_OVERRIDE) {
+      env.AGY_CLI_AUTO_COMPACT_OVERRIDE = config.COMPACT_OVERRIDE;
+    }
+
     let child;
     try {
       child = spawn(bin, args, {
         cwd,
-        env: { ...process.env, HOME: config.HOME, ELECTRON_RUN_AS_NODE: '' },
+        env,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
@@ -94,6 +101,15 @@ function runTurn(opts = {}) {
     }
     if (typeof globalThis.__agyRegisterChild === 'function') {
       try { globalThis.__agyRegisterChild(child); } catch {}
+    }
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        try { child.kill('SIGTERM'); } catch {}
+      } else {
+        opts.signal.addEventListener('abort', () => {
+          try { child.kill('SIGTERM'); } catch {}
+        }, { once: true });
+      }
     }
 
     let lineBuf = '';
@@ -155,8 +171,11 @@ function runTurn(opts = {}) {
       }
     }
 
-    child.stdout.on('data', (chunk) => {
-      const str = chunk.toString('utf8');
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+
+    function processStdoutStr(str) {
+      if (!str) return;
       rawStdout += str;
       if (checkMissingWarning(str)) {
         conversationMissing = true;
@@ -168,10 +187,15 @@ function runTurn(opts = {}) {
         lineBuf = lineBuf.slice(idx + 1);
         handleLine(line);
       }
+    }
+
+    child.stdout.on('data', (chunk) => {
+      const str = typeof chunk === 'string' ? chunk : stdoutDecoder.write(chunk);
+      processStdoutStr(str);
     });
 
     child.stderr.on('data', (chunk) => {
-      const str = chunk.toString('utf8');
+      const str = typeof chunk === 'string' ? chunk : stderrDecoder.write(chunk);
       stderr += str;
       if (checkMissingWarning(str) || checkMissingWarning(stderr)) {
         conversationMissing = true;
@@ -188,6 +212,14 @@ function runTurn(opts = {}) {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      const remOut = stdoutDecoder.end();
+      if (remOut) {
+        processStdoutStr(remOut);
+      }
+      const remErr = stderrDecoder.end();
+      if (remErr) {
+        stderr += remErr;
+      }
       if (lineBuf.trim()) {
         handleLine(lineBuf);
         lineBuf = '';

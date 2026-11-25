@@ -45,6 +45,7 @@ class TurnQueue {
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 120000;
     this.running = new Map();
     this.waiting = [];
+    this._reserved = 0;
   }
 
   get size() {
@@ -54,7 +55,7 @@ class TurnQueue {
   _killEntryChildren(entry, sig = 'SIGTERM') {
     if (entry.ctx) {
       const attached = entry.ctx.child || entry.ctx.proc || entry.ctx.process;
-      if (attached) entry.children.add(attached);
+      if (attached) entry.addChild(attached);
     }
     for (const child of entry.children) {
       try {
@@ -66,11 +67,37 @@ class TurnQueue {
   }
 
   _drain() {
-    while (this.running.size < this.maxConcurrent && this.waiting.length > 0) {
+    while (this.running.size + this._reserved < this.maxConcurrent && this.waiting.length > 0) {
       const next = this.waiting.shift();
       if (next.timer) clearTimeout(next.timer);
       if (next.cancelled) continue;
+      this._reserved++;
       next.grant();
+    }
+  }
+
+  async _preemptRunning(taskKey) {
+    const existing = this.running.get(taskKey);
+    if (!existing) return;
+
+    existing.preempted = true;
+    if (typeof existing.onPreempt === 'function') {
+      try { existing.onPreempt(); } catch {}
+    }
+    try { existing.controller.abort(); } catch {}
+    this._killEntryChildren(existing, 'SIGTERM');
+
+    let timer;
+    const released = await Promise.race([
+      existing.donePromise.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), 300);
+      }),
+    ]);
+    clearTimeout(timer);
+
+    if (!released && this.running.get(taskKey) === existing) {
+      throw new BusyError(`Key "${taskKey}" is still occupied 300ms after SIGTERM`);
     }
   }
 
@@ -88,37 +115,18 @@ class TurnQueue {
         if (queued.timer) clearTimeout(queued.timer);
         if (typeof queued.onPreempt === 'function') {
           try { queued.onPreempt(); } catch {}
-        } else if (typeof onPreempt === 'function') {
-          try { onPreempt(); } catch {}
         }
         queued.reject(new BusyError(`Queued task for key "${taskKey}" was preempted`));
       }
     }
 
     // If same key is currently running, preempt it with SIGTERM and wait up to 300ms
-    const existing = this.running.get(taskKey);
-    if (existing) {
-      existing.preempted = true;
-      if (typeof existing.onPreempt === 'function') {
-        try { existing.onPreempt(); } catch {}
-      } else if (typeof onPreempt === 'function') {
-        try { onPreempt(); } catch {}
-      }
-      try { existing.controller.abort(); } catch {}
-      this._killEntryChildren(existing, 'SIGTERM');
-
-      const released = await Promise.race([
-        existing.donePromise.then(() => true),
-        new Promise((resolve) => setTimeout(() => resolve(false), 300)),
-      ]);
-
-      if (!released && this.running.get(taskKey) === existing) {
-        throw new BusyError(`Key "${taskKey}" is still occupied 300ms after SIGTERM`);
-      }
+    if (this.running.has(taskKey)) {
+      await this._preemptRunning(taskKey);
     }
 
     // If concurrency limit is reached, wait in queue
-    if (this.running.size >= this.maxConcurrent) {
+    if (this.running.size + this._reserved >= this.maxConcurrent) {
       if (this.waiting.length >= this.limit) {
         throw new BusyError(`Queue limit (${this.limit}) exceeded`);
       }
@@ -139,6 +147,22 @@ class TurnQueue {
         }, this.timeoutMs);
         this.waiting.push(waiter);
       });
+
+      try {
+        if (this.running.has(taskKey)) {
+          await this._preemptRunning(taskKey);
+        }
+        if (this.running.has(taskKey)) {
+          throw new BusyError(`Key "${taskKey}" is already running`);
+        }
+      } catch (err) {
+        this._reserved--;
+        setImmediate(() => this._drain());
+        throw err;
+      }
+      this._reserved--;
+    } else if (this.running.has(taskKey)) {
+      throw new BusyError(`Key "${taskKey}" is already running`);
     }
 
     let resolveDone;
@@ -157,7 +181,19 @@ class TurnQueue {
       ctx: null,
       addChild(child) {
         if (!child) return;
-        children.add(child);
+        if (!children.has(child)) {
+          children.add(child);
+          const cleanup = () => {
+            children.delete(child);
+          };
+          if (typeof child.once === 'function') {
+            child.once('exit', cleanup);
+            child.once('close', cleanup);
+          } else if (typeof child.on === 'function') {
+            child.on('exit', cleanup);
+            child.on('close', cleanup);
+          }
+        }
         if (entry.preempted) {
           try {
             if (typeof child.kill === 'function' && !child.killed && child.exitCode === null) {
