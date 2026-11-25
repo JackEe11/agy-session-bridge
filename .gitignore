@@ -20,3 +20,6 @@ npm-debug.log*
 Thumbs.db
 .idea/
 .vscode/
+
+# 测试桩在 Windows 上生成的临时垫片
+tests/.fake-agy.cmd

@@ -2,20 +2,10 @@
 'use strict';
 const assert = require('assert');
 const path = require('path');
-const fs = require('fs');
 
 const SRC = path.join(__dirname, '..', 'src');
 const FAKE = path.join(__dirname, 'fake-agy.js');
 
-// Windows 无法直接 spawn 一个 .js（即使有 shebang），生成一个 .cmd 垫片。
-// 在类 Unix 上 fake-agy.js 靠 shebang + 可执行位即可运行。
-function spawnableBin(target) {
-  if (process.platform !== 'win32') return target;
-  const cmd = path.join(__dirname, '.fake-agy.cmd');
-  fs.writeFileSync(cmd, `@echo off\r\n"${process.execPath}" "${target}" %*\r\n`);
-  return cmd;
-}
-const FAKE_BIN = spawnableBin(FAKE);
 
 let pass = 0, fail = 0;
 async function t(name, fn) {
