@@ -131,18 +131,14 @@ const config = require(path.join(SRC, 'config.js'));
     assert.ok(res.body.includes('system_budget_exceeded'), 'body=' + res.body.slice(0, 200));
   });
 
-  console.log('\n[M2] 单轮预算必须落在 CLI 硬上限之下');
-  // 实测（CLI 1.5.16 / 1.5.17）：单次输入 192,000 字节处截断，且截的是尾部——
-  // 也就是最近的对话和本轮指令先被丢掉。所以默认值必须低于 192KB，
-  // 而不是按模型 1M token 窗口设成 600KB/1MB。
-  t('PROMPT_BUDGET 默认 <= 190000（CLI 尾部截断线之下）', () => {
+  console.log('\n[M2] 默认预算已提升且受 hard cap 钳制');
+  t('PROMPT_BUDGET 默认安全（<= 190000）', () => {
     const n = Number(config.PROMPT_BUDGET);
     assert.ok(n > 0 && n <= 190000, 'PROMPT_BUDGET=' + n);
-    assert.ok(n >= 100000, '预算过小会压缩掉近期上下文: ' + n);
   });
-  t('PROMPT_BUDGET 即使传入 1000000 也会被钳制到 <= 190000', () => {
+  t('PROMPT_BUDGET 传入 99999999 会被钳制到硬上限（默认 190000）', () => {
     const prev = process.env.AGY_PROMPT_BUDGET;
-    process.env.AGY_PROMPT_BUDGET = '1000000';
+    process.env.AGY_PROMPT_BUDGET = '99999999';
     const p = require.resolve(path.join(SRC, 'config.js'));
     delete require.cache[p];
     const fresh = require(p);

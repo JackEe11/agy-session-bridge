@@ -141,6 +141,35 @@ function parseSse(text) {
     assert.ok(/drift: 'advance'/.test(logs), '第二轮未判定为 advance：\n' + logs.slice(-800));
   });
 
+  console.log('\n[5] 流式请求在 CLI 首字之前先收到 200 + SSE 头（slow 模式）');
+  await t('slow 模式在首字到达前即收到 HTTP 200 与 text/event-stream', async () => {
+    const data = JSON.stringify({
+      model: 'fake',
+      stream: true,
+      messages: [{ role: 'system', content: SYS }, { role: 'user', content: 'slow 长预填测试' }],
+    });
+    const t0 = Date.now();
+    const got = await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port: PORT, path: '/v1/chat/completions', method: 'POST',
+        headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(data) },
+      }, (res) => {
+        const dt = Date.now() - t0;
+        const status = res.statusCode;
+        const ct = String(res.headers['content-type'] || '');
+        req.destroy();
+        resolve({ status, ct, dt });
+      });
+      req.on('error', (e) => reject(e));
+      req.write(data);
+      req.end();
+    });
+    assert.strictEqual(got.status, 200, 'HTTP ' + got.status);
+    assert.ok(got.ct.includes('text/event-stream'), 'content-type=' + got.ct);
+    assert.ok(got.dt < 5000, '等待响应头超时: ' + got.dt + 'ms');
+    await sleep(100);
+  });
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败`);
   srv.kill('SIGKILL');
   process.exit(fail ? 1 : 0);

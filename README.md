@@ -125,7 +125,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now agy-bridge
 | `AGY_BIN` | `$HOME/.local/bin/agy` | CLI 路径 |
 | `AGY_WORKSPACES` | `$HOME/.agy-bridge/chats` | 归档根目录 |
 | `AGY_STATE_FILE` | `$HOME/.agy-bridge/sessions.json` | 会话映射 |
-| `AGY_PROMPT_BUDGET` | `180000` | 单轮 prompt 字节上限，**硬钳制在 190000**：CLI 在 192,000 字节处从尾部截断，超了会丢最近的对话 |
+| `AGY_PROMPT_BUDGET` | `180000` | 单轮 prompt 字节上限，**硬钳制在 190000**。金丝雀实测：250KB 可整段送达，3.4MB 只留开头、中后段全丢。要放开须显式设 `AGY_PROMPT_HARD_CAP` |
 | `AGY_MAX_CONCURRENT` | `1` | 全局并发（1 轮 agy 峰值约 305MB） |
 | `AGY_COMPACT_OVERRIDE` | `85%` | 传给 CLI 的历史压缩阈值（与单轮 192KB 限制无关） |
 | `AGY_MAX_TURNS_PER_SESSION` | `60` | 超过后主动轮转新会话 |
@@ -149,18 +149,19 @@ sudo systemctl daemon-reload && sudo systemctl enable --now agy-bridge
 ## 测试
 
 ```bash
-node tests/test-core.js        # 16 用例：核心逻辑
-node tests/test-fixes.js       #  4 用例：并发上限、抢占语义、UTF-8 跨块解码、env 透传
-node tests/test-fixes2.js      #  8 用例：会话键顺序、重复请求漂移、状态原子写
-node tests/test-fixes4.js      #  8 用例：未来记忆泄漏、SIGKILL 升级、代理对、TOCTOU、msg.name
-node tests/test-audit-fixes.js #  5 用例：审计回归
-node tests/test-branch.js      #  4 用例：分支桶、LCP 选择、分叉继承
-node tests/test-memory.js      #  7 用例：三层记忆、预算钳制、strict system
-node tests/test-preset.js      #  4 用例：floor 切分、稳定 chatKey、override、bootstrap 提升
-node tests/test-server.js      #  4 用例：stream:false、错误状态码、失败不提交、哈希 trim 对齐
+node tests/test-core.js          # 16 用例：核心逻辑
+node tests/test-fixes.js         #  4 用例：并发上限、抢占语义、UTF-8 跨块解码、env 透传
+node tests/test-fixes2.js        #  8 用例：会话键顺序、重复请求漂移、状态原子写
+node tests/test-fixes4.js        #  8 用例：未来记忆泄漏、SIGKILL 升级、代理对、TOCTOU、msg.name
+node tests/test-audit-fixes.js   #  5 用例：审计回归
+node tests/test-audit-fixes-v2.js#  8 用例：卷层并发、种子、分支交互
+node tests/test-branch.js        #  4 用例：分支桶、LCP 选择、分叉继承
+node tests/test-memory.js        #  7 用例：三层记忆、预算钳制、strict system
+node tests/test-preset.js        #  4 用例：floor 切分、稳定 chatKey、override、bootstrap 提升
+node tests/test-server.js        #  5 用例：stream:false、错误状态码、失败不提交、哈希 trim 对齐
 ```
 
-共 **60 条**。覆盖：`recordFilter` 跨 delta 剥离、`upsertFloor` 幂等与回滚、`chatKey` 稳定性、`buildBootstrap` 预算、`driftOf` 三态、并发上限不被击穿、同角色卡双存档不串档、断连中止。
+共 **69 条**。覆盖：`recordFilter` 跨 delta 剥离、`upsertFloor` 幂等与回滚、`chatKey` 稳定性、`buildBootstrap` 预算、`driftOf` 三态、并发上限不被击穿、同角色卡双存档不串档、断连中止。
 
 ## 已知限制
 

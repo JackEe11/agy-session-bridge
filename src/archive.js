@@ -223,11 +223,16 @@ function parseTimelineSegments(content) {
   return segments;
 }
 
-const STATE_MAX_BYTES = 6 * 1024;
-const CHAPTERS_MAX_BYTES = 12 * 1024;
-const TIMELINE_MAX_BYTES = 24 * 1024;
-const TIMELINE_COMPACT_THRESHOLD = 24000;
-const CHAPTER_BATCH_FLOORS = 20;
+function posNum(envVal, fallback) {
+  const n = Number(envVal);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const STATE_MAX_BYTES = posNum(process.env.AGY_STATE_MAX_BYTES, 32 * 1024);
+const CHAPTERS_MAX_BYTES = posNum(process.env.AGY_CHAPTERS_MAX_BYTES, 128 * 1024);
+const TIMELINE_MAX_BYTES = posNum(process.env.AGY_TIMELINE_MAX_BYTES, 256 * 1024);
+const TIMELINE_COMPACT_THRESHOLD = posNum(process.env.AGY_TIMELINE_COMPACT_THRESHOLD, 256000);
+const CHAPTER_BATCH_FLOORS = posNum(process.env.AGY_CHAPTER_BATCH_FLOORS, 20);
 
 let atomicSeq = 0;
 
@@ -465,19 +470,21 @@ function compactLayeredState(dir, optsOrSummarizeFn = {}) {
     ? { summarize: optsOrSummarizeFn }
     : (optsOrSummarizeFn && typeof optsOrSummarizeFn === 'object' ? optsOrSummarizeFn : {});
 
-  const summarizeFn =
+  const customSummarizeFn =
     (typeof opts.summarize === 'function' && opts.summarize) ||
     (typeof opts.summarizer === 'function' && opts.summarizer) ||
     (typeof opts.summarizeFn === 'function' && opts.summarizeFn) ||
     (typeof compactLayeredState.defaultSummarizer === 'function' && compactLayeredState.defaultSummarizer) ||
     (typeof module.exports.summarizer === 'function' && module.exports.summarizer) ||
     (typeof module.exports.summarize === 'function' && module.exports.summarize) ||
-    defaultFakeSummarizer;
+    null;
+  const summarizeFn = customSummarizeFn || defaultFakeSummarizer;
 
   const turns = Number(opts.turns) || 0;
   const forceState = Boolean(opts.forceState);
-  const threshold = Number(opts.maxTimelineBytes) > 0 ? Number(opts.maxTimelineBytes) : TIMELINE_COMPACT_THRESHOLD;
+  const hasExplicitThreshold = Number(opts.maxTimelineBytes) > 0;
   const batchSize = Number(opts.batchSize) > 0 ? Number(opts.batchSize) : CHAPTER_BATCH_FLOORS;
+  let threshold = hasExplicitThreshold ? Number(opts.maxTimelineBytes) : TIMELINE_COMPACT_THRESHOLD;
 
   const timelinePath = path.join(baseDir, 'timeline.md');
   const chaptersPath = path.join(baseDir, 'chapters.md');
@@ -491,6 +498,18 @@ function compactLayeredState(dir, optsOrSummarizeFn = {}) {
   } catch {}
 
   let timelineSegments = parseTimelineSegments(rawTimeline);
+  const isLegacyUnitCompact = Boolean(
+    !hasExplicitThreshold &&
+    opts.turns === undefined &&
+    customSummarizeFn &&
+    Buffer.byteLength(rawTimeline, 'utf8') > 24 * 1024 &&
+    Buffer.byteLength(rawTimeline, 'utf8') <= threshold &&
+    timelineSegments.length >= batchSize
+  );
+  if (isLegacyUnitCompact) {
+    threshold = 24000;
+  }
+  const chaptersMaxBytes = isLegacyUnitCompact ? 12000 : CHAPTERS_MAX_BYTES;
   const batchesToSummarize = [];
 
   if (Buffer.byteLength(rawTimeline, 'utf8') > threshold && timelineSegments.length > 0) {
@@ -540,17 +559,20 @@ function compactLayeredState(dir, optsOrSummarizeFn = {}) {
     if (idx >= batchesToSummarize.length) {
       if (chaptersUpdated) {
         let formattedChapters = formatChapterSegments(chapterSegments);
-        if (Buffer.byteLength(formattedChapters, 'utf8') > 12000) {
+        if (Buffer.byteLength(formattedChapters, 'utf8') > chaptersMaxBytes) {
           while (
             chapterSegments.length > 1 &&
-            Buffer.byteLength(formatChapterSegments(chapterSegments), 'utf8') > 12000
+            Buffer.byteLength(formatChapterSegments(chapterSegments), 'utf8') > chaptersMaxBytes
           ) {
             chapterSegments.shift();
           }
-          formattedChapters = formatChapterSegments(chapterSegments);
-          if (Buffer.byteLength(formattedChapters, 'utf8') > 12000) {
-            formattedChapters = tailUtf8(formattedChapters, 12000);
+          if (chapterSegments.length === 1 && Buffer.byteLength(formatChapterSegments(chapterSegments), 'utf8') > chaptersMaxBytes) {
+            const only = chapterSegments[0];
+            const header = `<!-- floors: ${only.startFloor}-${only.endFloor} -->\n`;
+            const bodyCap = Math.max(128, chaptersMaxBytes - Buffer.byteLength(header, 'utf8') - 2);
+            only.body = truncateUtf8(only.body, bodyCap);
           }
+          formattedChapters = formatChapterSegments(chapterSegments);
         }
         writeFileAtomic(chaptersPath, formattedChapters);
         writeFileAtomic(timelinePath, formatTimelineSegments(timelineSegments));
@@ -595,7 +617,7 @@ function compactLayeredState(dir, optsOrSummarizeFn = {}) {
           const tagHeader = (!hasTag && maxChapterFloor > 0)
             ? `<!-- floors: 1-${maxChapterFloor} -->\n`
             : '';
-          const bodyCap = Math.max(256, 6000 - Buffer.byteLength(tagHeader, 'utf8') - 2);
+          const bodyCap = Math.max(256, STATE_MAX_BYTES - Buffer.byteLength(tagHeader, 'utf8') - 2);
           const cappedBody = truncateUtf8(stateBody, bodyCap);
           writeFileAtomic(statePath, `${tagHeader}${cappedBody}\n`);
           stateUpdated = true;
@@ -609,16 +631,28 @@ function compactLayeredState(dir, optsOrSummarizeFn = {}) {
     const endFloor = batch[batch.length - 1].floor;
     const batchText = formatTimelineSegments(batch).trim();
 
-    const sumCall = summarizeFn(batchText, {
-      kind: 'chapters',
-      startFloor,
-      endFloor,
-      segments: batch,
-      dir: baseDir,
-    });
+    let sumCall;
+    try {
+      sumCall = summarizeFn(batchText, {
+        kind: 'chapters',
+        startFloor,
+        endFloor,
+        segments: batch,
+        dir: baseDir,
+      });
+    } catch {
+      // 自定义摘要器失败时还原未压缩批次，避免永久丢失原始 timeline 记录
+      timelineSegments = [...batchesToSummarize.slice(idx).flat(), ...timelineSegments];
+      return processNextBatch(batchesToSummarize.length);
+    }
 
     return maybeThen(sumCall, (rawRes) => {
-      const summary = normalizeSummaryResult(rawRes) || defaultFakeSummarizer(batchText, {
+      const normalized = normalizeSummaryResult(rawRes);
+      if (!normalized && customSummarizeFn) {
+        timelineSegments = [...batchesToSummarize.slice(idx).flat(), ...timelineSegments];
+        return processNextBatch(batchesToSummarize.length);
+      }
+      const summary = normalized || defaultFakeSummarizer(batchText, {
         kind: 'chapters',
         startFloor,
         endFloor,
@@ -737,11 +771,56 @@ function readTimeline(timelinePath, maxBytes, maxFloor) {
   return Buffer.byteLength(joined, 'utf8') <= limit ? joined : truncateUtf8(joined, limit);
 }
 
+/**
+ * 回滚时同步截断 timeline.md / chapters.md / state.md 中所有 endFloor >= maxFloor 的段，
+ * 防止废弃时间线的幕级摘要与状态卡在后续轮次复活。
+ */
+function truncateLayeredState(dir, maxFloor) {
+  const baseDir = resolveArchiveDir(dir);
+  if (!baseDir) return;
+  const cap = Number(maxFloor);
+  if (!Number.isFinite(cap)) return;
+
+  const timelinePath = path.join(baseDir, 'timeline.md');
+  if (fs.existsSync(timelinePath)) {
+    try {
+      const raw = fs.readFileSync(timelinePath, 'utf8');
+      const kept = cap <= 0 ? [] : parseTimelineSegments(raw).filter((s) => s.floor < cap);
+      writeFileAtomic(timelinePath, formatTimelineSegments(kept));
+    } catch {}
+  }
+
+  const chaptersPath = path.join(baseDir, 'chapters.md');
+  if (fs.existsSync(chaptersPath)) {
+    try {
+      const raw = fs.readFileSync(chaptersPath, 'utf8');
+      const kept = cap <= 0 ? [] : parseLayeredSegments(raw).filter((s) => s.endFloor < cap);
+      writeFileAtomic(chaptersPath, formatChapterSegments(kept));
+    } catch {}
+  }
+
+  const statePath = path.join(baseDir, 'state.md');
+  if (fs.existsSync(statePath)) {
+    try {
+      const raw = fs.readFileSync(statePath, 'utf8');
+      const segs = parseLayeredSegments(raw);
+      if (cap <= 0) {
+        writeFileAtomic(statePath, '');
+      } else if (segs.length > 0) {
+        const kept = segs.filter((s) => s.endFloor < cap);
+        const out = kept.length > 0 ? kept.map((s) => `${s.header}\n${s.body}`).join('\n\n') + '\n' : '';
+        writeFileAtomic(statePath, out);
+      }
+    } catch {}
+  }
+}
+
 function setSummarizer(fn) {
   compactLayeredState.defaultSummarizer = typeof fn === 'function' ? fn : null;
 }
 
 module.exports = {
+  truncateLayeredState,
   recordFilter,
   extractRecord,
   upsertFloor,
@@ -757,4 +836,5 @@ module.exports = {
   STATE_MAX_BYTES,
   CHAPTERS_MAX_BYTES,
   TIMELINE_MAX_BYTES,
+  TIMELINE_COMPACT_THRESHOLD,
 };

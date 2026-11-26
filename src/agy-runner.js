@@ -193,8 +193,12 @@ function runTurn(opts = {}) {
     const bin = process.env.AGY_BIN || config.AGY_BIN;
     const env = { ...process.env, HOME: config.HOME };
     delete env.ELECTRON_RUN_AS_NODE;
-    if (config.COMPACT_OVERRIDE) {
-      env.AGY_CLI_AUTO_COMPACT_OVERRIDE = config.COMPACT_OVERRIDE;
+    const compactOverride =
+      process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE ||
+      process.env.AGY_COMPACT_OVERRIDE ||
+      config.COMPACT_OVERRIDE;
+    if (compactOverride) {
+      env.AGY_CLI_AUTO_COMPACT_OVERRIDE = compactOverride;
     }
 
     const spec = binSpec(bin, args);
@@ -241,7 +245,7 @@ function runTurn(opts = {}) {
     let conversationMissing = false;
     let missingNotified = false;
     let stderr = '';
-    let rawStdout = '';
+    let rawStdoutTail = '';
     let timedOut = false;
     let settled = false;
 
@@ -315,7 +319,7 @@ function runTurn(opts = {}) {
 
     function processStdoutStr(str) {
       if (!str) return;
-      rawStdout += str;
+      rawStdoutTail = (rawStdoutTail + str).slice(-1024);
       lineBuf += str;
       let idx;
       while ((idx = lineBuf.indexOf('\n')) >= 0) {
@@ -323,7 +327,7 @@ function runTurn(opts = {}) {
         lineBuf = lineBuf.slice(idx + 1);
         handleLine(line);
       }
-      if (checkMissingWarning(lineBuf)) {
+      if (checkMissingWarning(lineBuf) || checkMissingWarning(rawStdoutTail)) {
         triggerMissing();
       }
     }
@@ -364,7 +368,7 @@ function runTurn(opts = {}) {
         handleLine(lineBuf);
         lineBuf = '';
       }
-      if (checkMissingWarning(stderr) || checkMissingWarning(rawStdout)) {
+      if (checkMissingWarning(stderr) || checkMissingWarning(rawStdoutTail)) {
         triggerMissing();
       }
       const exitCode = typeof code === 'number'

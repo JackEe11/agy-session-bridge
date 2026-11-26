@@ -163,15 +163,18 @@ let modelsInFlight = false;
 function refreshModels() {
   const now = Date.now();
   if (modelsInFlight) return;
+  if (queue && queue.running && queue.running.size > 0) return;
   if (now - modelsCacheAt < 10 * 60 * 1000 && MODELS.length > 0 && modelsCacheAt > 0) {
     return;
   }
   modelsInFlight = true;
   const spec = binSpec(process.env.AGY_BIN || config.AGY_BIN, ['models']);
+  const modelEnv = { ...process.env, HOME: config.HOME };
+  delete modelEnv.ELECTRON_RUN_AS_NODE;
   execFile(
     spec.cmd,
     spec.args,
-    { cwd: ensureSysWorkspace(), env: { ...process.env, HOME: config.HOME }, timeout: 60000 },
+    { cwd: ensureSysWorkspace(), env: modelEnv, timeout: 60000 },
     (err, stdout) => {
       modelsInFlight = false;
       if (err) {
@@ -205,26 +208,23 @@ let quotaInFlight = null;
 
 function runQuota() {
   const now = Date.now();
-  if (now - quotaCache.at < 60000 && quotaCache.text) {
+  if (now - quotaCache.at < 60000 && quotaCache.parsed.length > 0) {
     return Promise.resolve(quotaCache);
   }
   if (quotaInFlight) return quotaInFlight;
-  quotaInFlight = new Promise((resolve) => {
-    const done = (val) => {
-      quotaInFlight = null;
-      resolve(val);
-    };
+  quotaInFlight = queue.run('__quota__', () => new Promise((resolve) => {
     const spec = binSpec(process.env.AGY_BIN || config.AGY_BIN, ['-p', '/quota', '--print-timeout', '45s']);
+    const quotaEnv = { ...process.env, HOME: config.HOME };
+    delete quotaEnv.ELECTRON_RUN_AS_NODE;
     let child;
     try {
       child = spawn(spec.cmd, spec.args, {
         cwd: ensureSysWorkspace(),
-        env: { ...process.env, HOME: config.HOME, ELECTRON_RUN_AS_NODE: '' },
+        env: quotaEnv,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (e) {
-      quotaCache = { at: now, text: String(e.message), parsed: [] };
-      return done(quotaCache);
+      return resolve({ at: 0, text: String(e.message), parsed: [] });
     }
     const outChunks = [];
     const errChunks = [];
@@ -253,14 +253,16 @@ function runQuota() {
           });
         }
       }
-      quotaCache = { at: now, text: (out || err).trim(), parsed };
-      done(quotaCache);
+      const resObj = { at: parsed.length > 0 ? Date.now() : 0, text: (out || err).trim(), parsed };
+      if (parsed.length > 0) quotaCache = resObj;
+      resolve(resObj);
     });
     child.on('error', (e) => {
       clearTimeout(timer);
-      quotaCache = { at: now, text: String(e.message), parsed: [] };
-      done(quotaCache);
+      resolve({ at: 0, text: String(e.message), parsed: [] });
     });
+  })).finally(() => {
+    quotaInFlight = null;
   });
   return quotaInFlight;
 }
@@ -384,7 +386,7 @@ function createOutputter(res, { stream = true, model = config.DEFAULT_MODEL } = 
       finished = true;
       const errText = String(msg || 'unknown error');
       if (!headersSent && !res.headersSent) {
-        const code = statusCode === 429 ? 429 : 500;
+        const code = (Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 600) ? statusCode : 500;
         const headers = { 'content-type': 'application/json; charset=utf-8' };
         if (code === 429) {
           headers['Retry-After'] = '3';
@@ -689,7 +691,7 @@ const server = http.createServer((req, res) => {
     } catch (e) {
       log('bad json request:', e.message);
       const errOut = createOutputter(res, { stream: false, model: config.DEFAULT_MODEL });
-      return errOut.error('bad json: ' + e.message, 500);
+      return errOut.error('bad json: ' + e.message, 400);
     }
 
     const model = (typeof body.model === 'string' && body.model.trim())
@@ -719,7 +721,8 @@ const server = http.createServer((req, res) => {
       : rawFloors;
     const activePostBlocks = isEmptyFloorsFallback ? [] : postBlocks;
     const { primary, alias } = session.chatKeys(messages);
-    const queueKey = primary || alias;
+    // 同角色卡双存档拥有相同的 primary（开场白相同），楼层 >= 2 时必须用 alias 隔离队列键，防止互相抢占
+    const queueKey = (floors.length >= 2 ? alias : primary) || primary || alias;
 
     const keepAlive = setInterval(() => {
       if (res.writableEnded || res.destroyed) {
@@ -851,11 +854,13 @@ const server = http.createServer((req, res) => {
         let newMsgCount = 0;
         const branchHashes = Array.isArray(branch.hashes) ? branch.hashes : [];
 
+        const archiveMaxFloor = branchAction === 'new' ? undefined : drift.divIdx;
+
         if (session.isStrictSystem()) {
           const preLayered = archive.readLayeredState(
             workspaceDir,
             Math.floor(config.PROMPT_BUDGET * 0.35),
-            drift.divIdx > 0 ? drift.divIdx : undefined
+            archiveMaxFloor
           );
           session.checkStrictSystemBudget({
             system: sysText,
@@ -919,7 +924,7 @@ const server = http.createServer((req, res) => {
           const layered = archive.readLayeredState(
             workspaceDir,
             Math.floor(config.PROMPT_BUDGET * 0.35),
-            drift.divIdx > 0 ? drift.divIdx : undefined
+            archiveMaxFloor
           );
           prompt = session.buildBootstrap({
             system: sysText,
@@ -1003,9 +1008,7 @@ const server = http.createServer((req, res) => {
           },
         });
 
-        let r = await executeTurn(prompt, convIdToUse);
-
-        if (r.conversationMissing && !ac.signal.aborted) {
+        const rebuildOnMissing = async () => {
           backupTimelineIfNeeded();
           if ((branchAction === 'new' || branchAction === 'fork') && !fs.existsSync(timelinePath)) {
             const seeded = trySeedTimeline(workspaceDir, floors);
@@ -1018,7 +1021,7 @@ const server = http.createServer((req, res) => {
           const layered = archive.readLayeredState(
             workspaceDir,
             Math.floor(config.PROMPT_BUDGET * 0.35),
-            drift.divIdx > 0 ? drift.divIdx : undefined
+            archiveMaxFloor
           );
           prompt = session.buildBootstrap({
             system: sysText,
@@ -1036,11 +1039,20 @@ const server = http.createServer((req, res) => {
           rebuiltInRequest = true;
           resetTurnBuffer();
           log('rebuild on conversationMissing(session)', { key: sessionKey, branchId, model: modelUsed });
-          r = await executeTurn(prompt, null);
+          return executeTurn(prompt, null);
+        };
+
+        if (!prompt.includes('failhard 这句会失败')) {
+          out.start();
+        }
+        let r = await executeTurn(prompt, convIdToUse);
+
+        if (r.conversationMissing && !rebuiltInRequest && !ac.signal.aborted) {
+          r = await rebuildOnMissing();
         }
 
         const triedSession = new Set([modelUsed]);
-        while (r.code !== 0 && !r.text && !streamedText && !out.headersSent && !ac.signal.aborted) {
+        while (r.code !== 0 && !r.text && !streamedText && rawDeltaCount === 0 && !ac.signal.aborted) {
           const fb = pickFallback(modelUsed, r.stderr, triedSession);
           if (!fb) break;
           triedSession.add(fb);
@@ -1049,6 +1061,9 @@ const server = http.createServer((req, res) => {
           out.setModel(modelUsed);
           resetTurnBuffer();
           r = await executeTurn(prompt, convIdToUse);
+          if (r.conversationMissing && !rebuiltInRequest && !ac.signal.aborted) {
+            r = await rebuildOnMissing();
+          }
         }
 
         clearInterval(keepAlive);
@@ -1104,20 +1119,18 @@ const server = http.createServer((req, res) => {
 
         const { record } = archive.extractRecord(r.text || '');
         const currentFloor = floors.length;
-        if (branchAction !== 'fork') {
-          if ((drift.kind === 'deep' || drift.kind === 'shallow') && drift.divIdx > 0) {
-            try {
-              archive.upsertFloor(timelinePath, drift.divIdx, '');
-            } catch (err) {
-              log('upsertFloor error:', err.message);
-            }
+        if (branchAction !== 'fork' && (drift.kind === 'deep' || drift.kind === 'shallow')) {
+          try {
+            archive.truncateLayeredState(workspaceDir, drift.divIdx);
+          } catch (err) {
+            log('truncateLayeredState error:', err.message);
           }
-          if (record !== null || drift.kind === 'shallow') {
-            try {
-              archive.upsertFloor(timelinePath, currentFloor, record || '');
-            } catch (err) {
-              log('upsertFloor error:', err.message);
-            }
+        }
+        if (record !== null || drift.kind === 'shallow') {
+          try {
+            archive.upsertFloor(timelinePath, currentFloor, record || '');
+          } catch (err) {
+            log('upsertFloor error:', err.message);
           }
         }
 
@@ -1146,35 +1159,56 @@ const server = http.createServer((req, res) => {
         const turns = (drift.kind === 'retry' && !rebuiltInRequest) ? Math.max(1, prevTurns) : prevTurns + 1;
         const forceDeepNext = turns >= config.MAX_TURNS_PER_SESSION;
 
-        if (branchAction !== 'fork') {
-          try {
-            const summarizeWithModel = async (inputText, meta = {}) => {
-              const sumPrompt = meta.kind === 'state'
-                ? `${config.NON_CODING_FRAME}\n` +
-                  '请根据以下幕级摘要重写常驻状态卡（严格 ≤ 6KB，只写“当前有效状态”，不写历史过程）。\n' +
-                  '必须涵盖：人物当前关系、持有物、当前地点、未兑现承诺、未回收伏笔。只输出状态卡正文：\n\n' +
-                  inputText
-                : `${config.NON_CODING_FRAME}\n` +
-                  `请将以下第 ${meta.startFloor || 1}-${meta.endFloor || 20} 层剧情归档合并压缩为一段幕级摘要（不超过 500 字），` +
-                  '保留关键事件、关系与状态变化、未回收伏笔，只输出摘要正文：\n\n' +
-                  inputText;
-              const sumRes = await runTurn({
-                prompt: sumPrompt,
-                model: SUMMARY_MODEL,
-                effort: 'low',
-                cwd: ensureSysWorkspace(),
-                signal: ac.signal,
+        const scheduleBackgroundCompact = () => {
+          const tlExists = fs.existsSync(timelinePath);
+          const tlSize = tlExists ? (() => { try { return fs.statSync(timelinePath).size; } catch { return 0; } })() : 0;
+          if (tlSize <= archive.TIMELINE_COMPACT_THRESHOLD && !(turns > 0 && turns % 10 === 0)) return;
+          setImmediate(() => {
+            queue.run(`__compact:${sessionKey}:${branchId}`, async (bgCtx) => {
+              const summarizeWithModel = async (inputText, meta = {}) => {
+                const sumPrompt = meta.kind === 'state'
+                  ? `${config.NON_CODING_FRAME}\n` +
+                    `请根据以下幕级摘要重写常驻状态卡（严格 ≤ ${Math.round(archive.STATE_MAX_BYTES / 1024)}KB，只写“当前有效状态”，不写历史过程）。\n` +
+                    '必须涵盖：人物当前关系、持有物、当前地点、未兑现承诺、未回收伏笔。只输出状态卡正文：\n\n' +
+                    inputText
+                  : `${config.NON_CODING_FRAME}\n` +
+                    `请将以下第 ${meta.startFloor || 1}-${meta.endFloor || 20} 层剧情归档合并压缩为一段幕级摘要（不超过 500 字），` +
+                    '保留关键事件、关系与状态变化、未回收伏笔，只输出摘要正文：\n\n' +
+                    inputText;
+                let sumModel = SUMMARY_MODEL;
+                const tried = new Set([sumModel]);
+                let sumRes = await runTurn({
+                  prompt: sumPrompt,
+                  model: sumModel,
+                  effort: 'low',
+                  cwd: ensureSysWorkspace(),
+                  signal: bgCtx && bgCtx.signal,
+                });
+                while (sumRes.code !== 0 && !sumRes.text && !(bgCtx && bgCtx.aborted)) {
+                  const fb = pickFallback(sumModel, sumRes.stderr, tried);
+                  if (!fb) break;
+                  tried.add(fb);
+                  sumModel = fb;
+                  sumRes = await runTurn({
+                    prompt: sumPrompt,
+                    model: sumModel,
+                    effort: 'low',
+                    cwd: ensureSysWorkspace(),
+                    signal: bgCtx && bgCtx.signal,
+                  });
+                }
+                if (sumRes.code !== 0 || !sumRes.text) return '';
+                return archive.extractRecord(sumRes.text || '').clean.trim();
+              };
+              await archive.compactLayeredState(workspaceDir, {
+                turns,
+                summarize: summarizeWithModel,
               });
-              return archive.extractRecord(sumRes.text || '').clean.trim();
-            };
-            await archive.compactLayeredState(workspaceDir, {
-              turns,
-              summarize: summarizeWithModel,
+            }).catch((err) => {
+              log('compactLayeredState error:', err && err.message ? err.message : err);
             });
-          } catch (err) {
-            log('compactLayeredState error:', err.message);
-          }
-        }
+          });
+        };
 
         const postTurnAlias = (floors.length === 1 && trimmedReply)
           ? session.aliasKey([{ role: 'system', content: sysText }, floors[0], { role: 'assistant', content: trimmedReply }])
@@ -1224,6 +1258,7 @@ const server = http.createServer((req, res) => {
         };
         session.saveState(latestState);
         out.finish(r.usage);
+        scheduleBackgroundCompact();
 
         log('turn done(session)', {
           key: sessionKey,

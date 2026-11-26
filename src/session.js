@@ -12,7 +12,9 @@ const FLOOR_MARKER_GLOBAL_RE = /(?:（第\s*\d+\s*楼）|【第\s*\d+\s*楼】|\
 const FLOOR_MARKER_SPLIT_RE = /(?=(?:（第\s*\d+\s*楼）|【第\s*\d+\s*楼】|\(第\s*\d+\s*楼\)))/;
 const FLOOR_MARKER_HEAD_RE = /^(?:（第\s*\d+\s*楼）|【第\s*\d+\s*楼】|\(第\s*\d+\s*楼\))/;
 const PRESET_BLOCK_MIN_BYTES = 4096;
-const RECENT_FLOOR_MAX_BYTES = 40000;
+const RECENT_FLOOR_MAX_BYTES = Number(process.env.AGY_RECENT_FLOOR_MAX_BYTES) > 0
+  ? Number(process.env.AGY_RECENT_FLOOR_MAX_BYTES)
+  : 400000;
 /* 酒馆注入的合成提示（不是用户真的说的话，也不能当楼层） */
 const NUDGE_MESSAGE_RE = /^\[(?:start a new chat|start a new group chat|example chat|new chat|continue|impersonate|regenerate)\]$/i;
 
@@ -756,8 +758,13 @@ function driftOf(sess, messagesOrFloors) {
     }
   }
 
+  // 酒馆 Swipe / Regenerate：去掉了上一轮追加的 AI 回复（长度恰好少 1），应走 shallow 覆盖并累计 swipeStreak
   if (target.hasAppendedReply && divIdx === hashes.length && synced.length === hashes.length + 1) {
-    return { kind: 'retry', divIdx };
+    const swipeStreak = typeof target.swipeStreak === 'number' ? target.swipeStreak : 0;
+    if (swipeStreak < config.MAX_SWIPE_STREAK) {
+      return { kind: 'shallow', divIdx };
+    }
+    return { kind: 'deep', divIdx };
   }
 
   if (divIdx === hashes.length && hashes.length < synced.length) {
@@ -773,40 +780,58 @@ function driftOf(sess, messagesOrFloors) {
   return { kind: 'deep', divIdx };
 }
 
-function copyTimelineBeforeLcp(parentDir, newDir, lcp) {
-  if (!newDir) return false;
-  try {
-    fs.mkdirSync(newDir, { recursive: true });
-    if (!parentDir) return false;
-    const srcPath = path.join(parentDir, 'timeline.md');
-    if (!fs.existsSync(srcPath)) return false;
-    const raw = fs.readFileSync(srcPath, 'utf8');
-    const re = /<!--\s*floor:\s*(\d+)\s*-->/g;
-    const matches = [];
-    let m;
-    while ((m = re.exec(raw)) !== null) {
-      matches.push({
-        floor: Number(m[1]),
-        start: m.index,
-        bodyStart: m.index + m[0].length,
-      });
-    }
-    const maxFloor = Number(lcp) || 0;
+function copyFilteredArchiveFile(srcPath, dstPath, maxFloor) {
+  if (!fs.existsSync(srcPath)) return false;
+  const raw = fs.readFileSync(srcPath, 'utf8');
+  const re = /<!--\s*(floors?):\s*(\d+)(?:\s*-\s*(\d+))?\s*-->/gi;
+  const matches = [];
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const startFloor = Number(m[2]);
+    const hasRange = m[3] !== undefined && m[3] !== '';
+    const endFloor = hasRange ? Number(m[3]) : startFloor;
+    const label = m[1].toLowerCase();
+    const header = (hasRange || label === 'floors')
+      ? `<!-- floors: ${startFloor}-${endFloor} -->`
+      : `<!-- floor: ${startFloor} -->`;
+    matches.push({
+      endFloor,
+      header,
+      start: m.index,
+      bodyStart: m.index + m[0].length,
+    });
+  }
+  let out = '';
+  if (matches.length === 0) {
+    out = maxFloor > 0 ? raw : '';
+  } else {
     const kept = [];
     for (let i = 0; i < matches.length; i++) {
       const cur = matches[i];
       const nextStart = i + 1 < matches.length ? matches[i + 1].start : raw.length;
       const body = raw.slice(cur.bodyStart, nextStart).trim();
-      if (cur.floor < maxFloor) {
-        kept.push(`<!-- floor: ${cur.floor} -->\n${body}`);
+      if (cur.endFloor < maxFloor) {
+        kept.push(`${cur.header}\n${body}`);
       }
     }
-    const out = kept.length > 0 ? kept.join('\n\n') + '\n' : '';
-    const dstPath = path.join(newDir, 'timeline.md');
-    const tmpPath = `${dstPath}.tmp.${process.pid}.${++seq}`;
-    fs.writeFileSync(tmpPath, out, 'utf8');
-    fs.renameSync(tmpPath, dstPath);
-    return true;
+    out = kept.length > 0 ? kept.join('\n\n') + '\n' : '';
+  }
+  const tmpPath = `${dstPath}.tmp.${process.pid}.${++seq}`;
+  fs.writeFileSync(tmpPath, out, 'utf8');
+  fs.renameSync(tmpPath, dstPath);
+  return true;
+}
+
+function copyTimelineBeforeLcp(parentDir, newDir, lcp) {
+  if (!newDir) return false;
+  try {
+    fs.mkdirSync(newDir, { recursive: true });
+    if (!parentDir) return false;
+    const maxFloor = Number(lcp) || 0;
+    const copiedTl = copyFilteredArchiveFile(path.join(parentDir, 'timeline.md'), path.join(newDir, 'timeline.md'), maxFloor);
+    const copiedCh = copyFilteredArchiveFile(path.join(parentDir, 'chapters.md'), path.join(newDir, 'chapters.md'), maxFloor);
+    const copiedSt = copyFilteredArchiveFile(path.join(parentDir, 'state.md'), path.join(newDir, 'state.md'), maxFloor);
+    return copiedTl || copiedCh || copiedSt;
   } catch {
     return false;
   }
@@ -1132,27 +1157,66 @@ function buildBootstrap({
   const maxFixedBytes = recentCandidates.length > 0 ? Math.floor(budget * 0.75) : budget;
 
   if (fixedBytes > maxFixedBytes) {
-    const timelineCap = Math.max(0, Math.floor(budget * 0.2));
+    const timelineCap = Math.max(0, Math.floor(budget * 0.18));
     if (Buffer.byteLength(timelineText, 'utf8') > timelineCap) {
       timelineSection = `[TIMELINE]\n${tailUtf8(timelineText, timelineCap)}`;
     }
-    const openingCap = Math.max(0, Math.floor(budget * 0.15));
+    if (chaptersSection) {
+      const chaptersCap = Math.max(0, Math.floor(budget * 0.1));
+      if (Buffer.byteLength(chaptersText.trim(), 'utf8') > chaptersCap) {
+        chaptersSection = `[CHAPTERS]\n${tailUtf8(chaptersText.trim(), chaptersCap)}`;
+      }
+    }
+    const openingCap = Math.max(0, Math.floor(budget * 0.12));
     if (Buffer.byteLength(openingBlock, 'utf8') > openingCap) {
       openingSection = `[OPENING]\n${capHeadTailUtf8(openingBlock, openingCap)}`;
     }
     if (postSection) {
-      const postCap = Math.max(0, Math.floor(budget * 0.1));
+      const postCap = Math.max(0, Math.floor(budget * 0.08));
       if (Buffer.byteLength(postText, 'utf8') > postCap) {
         postSection = `[POST]\n${capHeadTailUtf8(postText, postCap)}`;
       }
     }
-    const otherFixedBytes = Buffer.byteLength(
-      `${[openingSection, timelineSection, ...(postSection ? [postSection] : [])].join('\n\n')}\n\n${recentHeader}\n\n[SYSTEM]\n`,
-      'utf8'
-    );
-    const sysCap = Math.max(0, maxFixedBytes - otherFixedBytes);
+    const calcOtherFixed = () => {
+      const others = [openingSection];
+      if (stateSection) others.push(stateSection);
+      if (chaptersSection) others.push(chaptersSection);
+      others.push(timelineSection);
+      if (postSection) others.push(postSection);
+      return Buffer.byteLength(`${others.join('\n\n')}\n\n${recentHeader}\n\n[SYSTEM]\n`, 'utf8');
+    };
+    let otherFixedBytes = calcOtherFixed();
+    let sysCap = Math.max(0, maxFixedBytes - otherFixedBytes);
     if (Buffer.byteLength(sysText, 'utf8') > sysCap) {
-      sysSection = `[SYSTEM]\n${capHeadTailUtf8(sysText, sysCap)}`;
+      if (isStrictSystem()) {
+        // 严格模式绝不静默砍 [SYSTEM]：优先继续压缩非核心固定段
+        let over = Buffer.byteLength(assemblePrefix(), 'utf8') - maxFixedBytes;
+        if (over > 0 && timelineSection.length > 11) {
+          const cur = Buffer.byteLength(timelineSection, 'utf8') - 11;
+          const keep = Math.max(0, cur - over);
+          timelineSection = `[TIMELINE]\n${tailUtf8(timelineText, keep)}`;
+          over = Buffer.byteLength(assemblePrefix(), 'utf8') - maxFixedBytes;
+        }
+        if (over > 0 && chaptersSection) {
+          const cur = Buffer.byteLength(chaptersSection, 'utf8') - 11;
+          const keep = Math.max(0, cur - over);
+          chaptersSection = keep > 0 ? `[CHAPTERS]\n${tailUtf8(chaptersText.trim(), keep)}` : '';
+          over = Buffer.byteLength(assemblePrefix(), 'utf8') - maxFixedBytes;
+        }
+        if (over > 0 && postSection) {
+          const cur = Buffer.byteLength(postSection, 'utf8') - 7;
+          const keep = Math.max(0, cur - over);
+          postSection = keep > 0 ? `[POST]\n${capHeadTailUtf8(postText, keep)}` : '';
+          over = Buffer.byteLength(assemblePrefix(), 'utf8') - maxFixedBytes;
+        }
+        if (over > 0 && openingSection.length > 10) {
+          const cur = Buffer.byteLength(openingSection, 'utf8') - 10;
+          const keep = Math.max(0, cur - over);
+          openingSection = `[OPENING]\n${capHeadTailUtf8(openingBlock, keep)}`;
+        }
+      } else {
+        sysSection = `[SYSTEM]\n${capHeadTailUtf8(sysText, sysCap)}`;
+      }
     }
   }
 
@@ -1218,15 +1282,20 @@ function buildOverride({ divIdx = 0, floors, messages = [] } = {}) {
 
   const start = Math.max(0, Number(divIdx) || 0);
   const sliced = source.slice(start);
-  const body = sliced.map((m, i) => formatMessage(m, start + i, RECENT_FLOOR_MAX_BYTES)).join('\n\n');
+  let header;
+  let body;
+  if (sliced.length === 0 && source.length > 0) {
+    const lastIdx = source.length - 1;
+    header = `[TIMELINE OVERRIDE]\n此前第 ${start} 层的旧回复已作废，请完全忽略该旧回复，针对下面第 ${lastIdx} 层重新生成回复：\n\n`;
+    body = formatMessage(source[lastIdx], lastIdx, RECENT_FLOOR_MAX_BYTES);
+  } else {
+    header = `[TIMELINE OVERRIDE]\n从第 ${start} 层起对话历史已回退或改写，请忽略此前第 ${start} 层及之后的旧内容，以如下最新记录为准继续回复：\n\n`;
+    body = sliced.map((m, i) => formatMessage(m, start + i, RECENT_FLOOR_MAX_BYTES)).join('\n\n');
+  }
 
-  const raw =
-    `[TIMELINE OVERRIDE]\n` +
-    `从第 ${start} 层起对话历史已回退或改写，请忽略此前第 ${start} 层及之后的旧内容，以如下最新记录为准继续回复：\n\n` +
-    body;
+  const raw = header + body;
 
   if (Buffer.byteLength(raw, 'utf8') > config.PROMPT_BUDGET) {
-    const header = `[TIMELINE OVERRIDE]\n从第 ${start} 层起对话历史已回退或改写，以如下最新记录为准继续回复：\n\n`;
     const budget = Math.max(0, config.PROMPT_BUDGET - Buffer.byteLength(header, 'utf8'));
     return header + tailUtf8(body, budget);
   }
@@ -1255,4 +1324,5 @@ module.exports = {
   formatMessage,
   formatRoleLabel,
   FLOOR_MARKER_HEAD_RE,
+  RECENT_FLOOR_MAX_BYTES,
 };

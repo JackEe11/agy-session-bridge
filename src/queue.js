@@ -39,10 +39,12 @@ class TurnQueue {
     maxConcurrent = config.MAX_CONCURRENT,
     limit = config.QUEUE_LIMIT,
     timeoutMs = config.QUEUE_TIMEOUT_MS,
+    preemptWaitMs = config.PREEMPT_WAIT_MS,
   } = {}) {
     this.maxConcurrent = Number(maxConcurrent) > 0 ? Number(maxConcurrent) : 1;
     this.limit = Number(limit) >= 0 ? Number(limit) : 2;
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 120000;
+    this.preemptWaitMs = Number(preemptWaitMs) > 0 ? Number(preemptWaitMs) : 1500;
     this.running = new Map();
     this.waiting = [];
     this._reserved = 0;
@@ -88,16 +90,17 @@ class TurnQueue {
     this._killEntryChildren(existing, 'SIGTERM');
 
     let timer;
+    const waitMs = this.preemptWaitMs;
     const released = await Promise.race([
       existing.donePromise.then(() => true),
       new Promise((resolve) => {
-        timer = setTimeout(() => resolve(false), 300);
+        timer = setTimeout(() => resolve(false), waitMs);
       }),
     ]);
     clearTimeout(timer);
 
     if (!released && this.running.get(taskKey) === existing) {
-      throw new BusyError(`Key "${taskKey}" is still occupied 300ms after SIGTERM`);
+      throw new BusyError(`Key "${taskKey}" is still occupied ${waitMs}ms after SIGTERM`);
     }
   }
 
