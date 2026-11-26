@@ -28,10 +28,10 @@ function rawKillChild(child, sig) {
 /**
  * 统一终止子进程：
  * 1) 发送 SIGTERM
- * 2) 起 3 秒定时器，若仍未 exit 则发送 SIGKILL
+ * 2) 起 800ms 定时器，若仍未 exit 则发送 SIGKILL
  * 3) child exit/close 时清理定时器
  */
-function terminateChild(child, graceMs = 3000) {
+function terminateChild(child, graceMs = 800) {
   if (!child) return;
   if (child.exitCode !== null && child.exitCode !== undefined) return;
   if (child.signalCode !== null && child.signalCode !== undefined) return;
@@ -70,7 +70,7 @@ function terminateChild(child, graceMs = 3000) {
   }
 
   if (!child.__agyKillTimer) {
-    const waitMs = Number(graceMs) > 0 ? Number(graceMs) : 3000;
+    const waitMs = Number(graceMs) > 0 ? Number(graceMs) : 800;
     child.__agyKillTimer = setTimeout(() => {
       child.__agyKillTimer = null;
       if (
@@ -158,7 +158,8 @@ function runTurn(opts = {}) {
       : config.DEFAULT_MODEL;
     const timeoutMs = Number(opts.timeoutMs) > 0 ? Number(opts.timeoutMs) : config.TURN_TIMEOUT_MS;
     const timeoutSec = Math.max(1, Math.ceil(timeoutMs / 1000));
-    const onDelta = typeof opts.onDelta === 'function' ? opts.onDelta : null;
+    const silent = Boolean(opts.silent);
+    const onDelta = (!silent && typeof opts.onDelta === 'function') ? opts.onDelta : null;
     const onMissing = typeof opts.onMissing === 'function' ? opts.onMissing : null;
 
     // 刻意不传 -p：当前依靠管道 stdin 隐式进入 print 模式，保持现状以兼容长 prompt 管道输入
@@ -191,7 +192,10 @@ function runTurn(opts = {}) {
     }
 
     const bin = process.env.AGY_BIN || config.AGY_BIN;
-    const env = { ...process.env, HOME: config.HOME };
+    const effectiveHome = (typeof opts.home === 'string' && opts.home.trim())
+      ? opts.home.trim()
+      : config.HOME;
+    const env = { ...process.env, HOME: effectiveHome };
     delete env.ELECTRON_RUN_AS_NODE;
     const compactOverride =
       process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE ||
@@ -302,8 +306,20 @@ function runTurn(opts = {}) {
         if (res.usage && typeof res.usage === 'object') {
           usage = res.usage;
         }
-        if (res.conversation_id && !conversationId) {
+        if (res.conversation_id) {
           conversationId = String(res.conversation_id);
+        }
+        if (res.error) {
+          const errStr = typeof res.error === 'string' ? res.error : JSON.stringify(res.error);
+          if (errStr && !stderr.includes(errStr)) {
+            stderr += (stderr ? '\n' : '') + errStr;
+          }
+        }
+      } else if (evt.event === 'error' || evt.error) {
+        const errPayload = evt.error || evt.message || evt;
+        const errStr = typeof errPayload === 'string' ? errPayload : JSON.stringify(errPayload);
+        if (errStr && !stderr.includes(errStr)) {
+          stderr += (stderr ? '\n' : '') + errStr;
         }
       }
 
@@ -380,9 +396,13 @@ function runTurn(opts = {}) {
           ? resultText
           : (deltaText || resultText || ''));
 
+      if (!silent && exitCode !== 0 && !text && rawStdoutTail.trim() && !stderr.includes(rawStdoutTail.trim())) {
+        stderr += (stderr ? '\n' : '') + rawStdoutTail.trim();
+      }
+
       resolve({
         code: exitCode,
-        text,
+        text: silent ? (text || '') : text,
         conversationId: conversationId || null,
         usage: usage || null,
         conversationMissing,

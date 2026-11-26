@@ -36,10 +36,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     let childKilled = false;
 
     const first = q.run('same', async () => {
-      const cp = require('child_process');
-      const child = process.platform === 'win32'
-        ? cp.spawn(process.execPath, [FAKE], { env: { ...process.env } })
-        : cp.spawn(FAKE, [], { env: { ...process.env } });
+      const child = require('child_process').spawn(FAKE, [], { env: { ...process.env } });
       child.stdin.write('slow'); child.stdin.end();
       child.on('exit', (code, sig) => { if (sig === 'SIGTERM' || code === 143) childKilled = true; });
       q.registerActiveChild && q.registerActiveChild('same', child);

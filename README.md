@@ -79,6 +79,21 @@ agy-session-bridge (:8787, 仅回环)
 2. **按楼层幂等落盘**：`works/chats/<key>/timeline.md`，回滚到旧层会截断更高楼层；
 3. **只在 bootstrap 注入**：常态轮次不重复注入，避免同一记录在 CLI 历史里出现 N 次导致复读。
 
+## 突破单轮限制：分片预热
+
+单轮 stdin 超过约 185KB 会被 CLI 丢弃中后段（见 `docs/FINDINGS.md` 的金丝雀实测），但**一段对话可以拆成多个分片、用多轮 CLI 调用把它们喂进同一个会话**。
+
+```
+第 1 片  [SYSTEM][OPENING][STATE][CHAPTERS 前半]   ≤165KB
+第 2 片  [CHAPTERS 后半][TIMELINE]                 ≤165KB
+第 3 片  [RECENT]                                   ≤165KB
+         ↓  全部成功后才发真正的本轮提问
+本轮     [新消息 + postBlocks 差分]
+```
+
+于是有效上下文是 `CHUNKED_TOTAL_BUDGET`（默认 700KB，最多 8 片），而不是单片的 165KB。每片仍受 185KB 硬闸门保护；任何一片失败都会回退到单片 bootstrap。
+
+预热只在 `deep` 重建时发生，`advance` 仍是"只发增量"，不产生额外开销。
 ## 快速开始
 
 ### 1. 安装并登录 Antigravity CLI
@@ -132,6 +147,13 @@ sudo systemctl daemon-reload && sudo systemctl enable --now agy-bridge
 | `AGY_DEFAULT_MODEL` | `gemini-4-argon-high` | 未指定模型时的默认值 |
 | `AGY_SESSION_MODE` | `1` | 设为 `0` → 退回无状态模式（旧行为） |
 | `AGY_BRIDGE_TOKEN_FILE` | `$HOME/.agy-bridge/token` | 非回环访问所需的 Bearer token |
+| `AGY_HARD_GATE` | `185000` | 写入子进程前的字节级最终闸门，超了直接拒绝而不是发半截 |
+| `AGY_CHUNKED_BOOTSTRAP` | `1` | 重建时是否启用分片预热 |
+| `AGY_WARM_CHUNK_BYTES` | `165000` | 单个分片的字节预算（必须小于 185000） |
+| `AGY_CHUNKED_TOTAL_BUDGET` | `700000` | 分片预热的总预算，默认 700KB |
+| `AGY_WARM_MAX_CHUNKS` | `8` | 最多拆成几片 |
+| `AGY_ACCOUNTS` | （空） | 多账号列表，某账号额度耗尽时自动换号 |
+| `AGY_MAX_BRANCHES` | `16` | 每个聊天最多保留的分支桶数 |
 
 ## 实测数据（供参考）
 
@@ -149,19 +171,10 @@ sudo systemctl daemon-reload && sudo systemctl enable --now agy-bridge
 ## 测试
 
 ```bash
-node tests/test-core.js          # 16 用例：核心逻辑
-node tests/test-fixes.js         #  4 用例：并发上限、抢占语义、UTF-8 跨块解码、env 透传
-node tests/test-fixes2.js        #  8 用例：会话键顺序、重复请求漂移、状态原子写
-node tests/test-fixes4.js        #  8 用例：未来记忆泄漏、SIGKILL 升级、代理对、TOCTOU、msg.name
-node tests/test-audit-fixes.js   #  5 用例：审计回归
-node tests/test-audit-fixes-v2.js#  8 用例：卷层并发、种子、分支交互
-node tests/test-branch.js        #  4 用例：分支桶、LCP 选择、分叉继承
-node tests/test-memory.js        #  7 用例：三层记忆、预算钳制、strict system
-node tests/test-preset.js        #  4 用例：floor 切分、稳定 chatKey、override、bootstrap 提升
-node tests/test-server.js        #  5 用例：stream:false、错误状态码、失败不提交、哈希 trim 对齐
+for t in tests/test-*.js; do node "$t"; done   # 12 套，82 用例
 ```
 
-共 **69 条**。覆盖：`recordFilter` 跨 delta 剥离、`upsertFloor` 幂等与回滚、`chatKey` 稳定性、`buildBootstrap` 预算、`driftOf` 三态、并发上限不被击穿、同角色卡双存档不串档、断连中止。
+共 **82 条**（12 套）。覆盖：`recordFilter` 跨 delta 剥离、`upsertFloor` 幂等与回滚、`chatKey` 稳定性、`buildBootstrap` 预算、`driftOf` 三态、并发上限不被击穿、同角色卡双存档不串档、断连中止。
 
 ## 已知限制
 

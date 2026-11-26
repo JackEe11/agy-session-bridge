@@ -44,7 +44,7 @@ class TurnQueue {
     this.maxConcurrent = Number(maxConcurrent) > 0 ? Number(maxConcurrent) : 1;
     this.limit = Number(limit) >= 0 ? Number(limit) : 2;
     this.timeoutMs = Number(timeoutMs) > 0 ? Number(timeoutMs) : 120000;
-    this.preemptWaitMs = Number(preemptWaitMs) > 0 ? Number(preemptWaitMs) : 1500;
+    this.preemptWaitMs = Number(preemptWaitMs) > 0 ? Number(preemptWaitMs) : 2500;
     this.running = new Map();
     this.waiting = [];
     this._reserved = 0;
@@ -68,9 +68,32 @@ class TurnQueue {
     }
   }
 
+  _evictWaitingLow() {
+    let evicted = 0;
+    for (let i = this.waiting.length - 1; i >= 0; i--) {
+      if (this.waiting[i].priority === 'low') {
+        const queued = this.waiting.splice(i, 1)[0];
+        queued.cancelled = true;
+        if (queued.timer) clearTimeout(queued.timer);
+        if (typeof queued.onPreempt === 'function') {
+          try { queued.onPreempt(); } catch {}
+        }
+        if (typeof queued.yield === 'function') {
+          queued.yield();
+        } else {
+          queued.reject(new BusyError(`Low priority task "${queued.key}" yielded`));
+        }
+        evicted++;
+      }
+    }
+    return evicted;
+  }
+
   _drain() {
     while (this.running.size + this._reserved < this.maxConcurrent && this.waiting.length > 0) {
-      const next = this.waiting.shift();
+      let idx = this.waiting.findIndex((w) => !w.cancelled && w.priority !== 'low');
+      if (idx < 0) idx = 0;
+      const next = this.waiting.splice(idx, 1)[0];
       if (next.timer) clearTimeout(next.timer);
       if (next.cancelled) continue;
       this._reserved++;
@@ -105,55 +128,119 @@ class TurnQueue {
   }
 
   /**
-   * 同一个 key 已有任务在跑时：先 SIGTERM 旧进程，300ms 后仍占用则抛 BusyError
+   * 同一个 key 已有任务在跑时：先 SIGTERM 旧进程，preemptWaitMs 后仍占用则抛 BusyError。
+   * 支持优先级 priority: 'high' | 'low'（默认 'high'）：
+   * 低优先级在等待或运行中遇到 high 且并发已满时主动让位。
    */
-  async run(key, fn, { onPreempt } = {}) {
+  async run(key, fn, { onPreempt, priority = 'high' } = {}) {
     const taskKey = String(key || 'default');
+    const taskPriority = priority === 'low' ? 'low' : 'high';
 
     // If same key is waiting in queue, remove and preempt the queued entry
     for (let i = this.waiting.length - 1; i >= 0; i--) {
       if (this.waiting[i].key === taskKey) {
+        if (taskPriority === 'low' && this.waiting[i].priority !== 'low') {
+          if (typeof onPreempt === 'function') {
+            try { onPreempt(); } catch {}
+          }
+          return undefined;
+        }
         const queued = this.waiting.splice(i, 1)[0];
         queued.cancelled = true;
         if (queued.timer) clearTimeout(queued.timer);
         if (typeof queued.onPreempt === 'function') {
           try { queued.onPreempt(); } catch {}
         }
-        queued.reject(new BusyError(`Queued task for key "${taskKey}" was preempted`));
+        if (queued.priority === 'low' && typeof queued.yield === 'function') {
+          queued.yield();
+        } else {
+          queued.reject(new BusyError(`Queued task for key "${taskKey}" was preempted`));
+        }
       }
     }
 
-    // If same key is currently running, preempt it with SIGTERM and wait up to 300ms
+    // If same key is currently running, preempt it with SIGTERM
     if (this.running.has(taskKey)) {
+      const runningSame = this.running.get(taskKey);
+      if (taskPriority === 'low' && runningSame && runningSame.priority !== 'low') {
+        if (typeof onPreempt === 'function') {
+          try { onPreempt(); } catch {}
+        }
+        return undefined;
+      }
       await this._preemptRunning(taskKey);
+    }
+
+    // High priority task arriving when concurrency is full: evict waiting low tasks & preempt running low tasks
+    if (taskPriority === 'high' && this.running.size + this._reserved >= this.maxConcurrent) {
+      this._evictWaitingLow();
+      for (const [runKey, runEntry] of this.running.entries()) {
+        if (runEntry && runEntry.priority === 'low') {
+          await this._preemptRunning(runKey);
+          if (this.running.size + this._reserved < this.maxConcurrent) break;
+        }
+      }
     }
 
     // If concurrency limit is reached, wait in queue
     if (this.running.size + this._reserved >= this.maxConcurrent) {
+      if (taskPriority === ' high' || taskPriority === 'high') {
+        this._evictWaitingLow();
+      } else if (
+        this.waiting.some((w) => !w.cancelled && w.priority !== 'low') ||
+        this.waiting.length >= this.limit
+      ) {
+        // Low priority task yields immediately if high priority tasks are waiting or queue is full
+        if (typeof onPreempt === 'function') {
+          try { onPreempt(); } catch {}
+        }
+        return undefined;
+      }
       if (this.waiting.length >= this.limit) {
         throw new BusyError(`Queue limit (${this.limit}) exceeded`);
       }
-      await new Promise((resolve, reject) => {
+      const yielded = await new Promise((resolve, reject) => {
         const waiter = {
           key: taskKey,
+          priority: taskPriority,
           onPreempt,
           cancelled: false,
           timer: null,
-          grant: resolve,
+          grant: () => resolve(false),
+          yield: () => resolve(true),
           reject,
         };
         waiter.timer = setTimeout(() => {
           const idx = this.waiting.indexOf(waiter);
           if (idx >= 0) this.waiting.splice(idx, 1);
           waiter.cancelled = true;
-          reject(new BusyError(`Queue timeout after ${this.timeoutMs}ms`));
+          if (taskPriority === 'low') {
+            if (typeof onPreempt === 'function') {
+              try { onPreempt(); } catch {}
+            }
+            resolve(true);
+          } else {
+            reject(new BusyError(`Queue timeout after ${this.timeoutMs}ms`));
+          }
         }, this.timeoutMs);
         this.waiting.push(waiter);
       });
 
+      if (yielded) {
+        return undefined;
+      }
+
       try {
         if (this.running.has(taskKey)) {
           await this._preemptRunning(taskKey);
+        }
+        if (taskPriority === 'high' && this.running.size >= this.maxConcurrent) {
+          for (const [runKey, runEntry] of this.running.entries()) {
+            if (runEntry && runEntry.priority === 'low') {
+              await this._preemptRunning(runKey);
+              if (this.running.size < this.maxConcurrent) break;
+            }
+          }
         }
         if (this.running.has(taskKey)) {
           throw new BusyError(`Key "${taskKey}" is already running`);
@@ -175,6 +262,7 @@ class TurnQueue {
 
     const entry = {
       key: taskKey,
+      priority: taskPriority,
       onPreempt,
       preempted: false,
       controller,

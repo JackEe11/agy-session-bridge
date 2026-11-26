@@ -131,12 +131,12 @@ const config = require(path.join(SRC, 'config.js'));
     assert.ok(res.body.includes('system_budget_exceeded'), 'body=' + res.body.slice(0, 200));
   });
 
-  console.log('\n[M2] 默认预算已提升且受 hard cap 钳制');
-  t('PROMPT_BUDGET 默认安全（<= 190000）', () => {
+  console.log('\n[M2] 预算策略（FINDINGS.md：CLI 在 192,000 字节处截断尾部）');
+  t('PROMPT_BUDGET 默认 == 180000（< 硬顶 190000）', () => {
     const n = Number(config.PROMPT_BUDGET);
-    assert.ok(n > 0 && n <= 190000, 'PROMPT_BUDGET=' + n);
+    assert.strictEqual(n, 180000, 'PROMPT_BUDGET=' + n);
   });
-  t('PROMPT_BUDGET 传入 99999999 会被钳制到硬上限（默认 190000）', () => {
+  t('PROMPT_BUDGET 即使传入 99999999 也会被钳制到 190000', () => {
     const prev = process.env.AGY_PROMPT_BUDGET;
     process.env.AGY_PROMPT_BUDGET = '99999999';
     const p = require.resolve(path.join(SRC, 'config.js'));
@@ -147,7 +147,7 @@ const config = require(path.join(SRC, 'config.js'));
     if (prev === undefined) delete process.env.AGY_PROMPT_BUDGET;
     else process.env.AGY_PROMPT_BUDGET = prev;
     require(p);
-    assert.ok(n <= 190000, '未钳制: ' + n);
+    assert.strictEqual(n, 190000, '未钳制: ' + n);
   });
   t('COMPACT_OVERRIDE 默认 >= 80%', () => {
     assert.ok(parseInt(String(config.COMPACT_OVERRIDE), 10) >= 80, 'COMPACT_OVERRIDE=' + config.COMPACT_OVERRIDE);
