@@ -16,15 +16,6 @@ const RECENT_FLOOR_MAX_BYTES = 40000;
 /* 酒馆注入的合成提示（不是用户真的说的话，也不能当楼层） */
 const NUDGE_MESSAGE_RE = /^\[(?:start a new chat|start a new group chat|example chat|new chat|continue|impersonate|regenerate)\]$/i;
 
-if (!('content' in String.prototype)) {
-  Object.defineProperty(String.prototype, 'content', {
-    get() {
-      return String(this);
-    },
-    configurable: true,
-  });
-}
-
 function textOf(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -119,6 +110,14 @@ function splitFloors(messages) {
   const floors = [];
   const pendingPost = [];
 
+  // 仅当会话中实际存在合并楼层标记（如「（第N楼）」）时，才把无标记的超长消息归类为预设块；
+  // 否则普通长消息（>4KB，约 1365 中文字）必须保留为正常楼层，防止被吞掉。
+  const hasMergedFloors = list.some((m) => {
+    if (!m || typeof m !== 'object' || isSystemRole(m.role)) return false;
+    const matches = textOf(m.content).match(FLOOR_MARKER_GLOBAL_RE);
+    return Boolean(matches && matches.length >= 2);
+  });
+
   for (const m of list) {
     if (!m || typeof m !== 'object' || isSystemRole(m.role)) continue;
     const raw = textOf(m.content);
@@ -149,7 +148,7 @@ function splitFloors(messages) {
       continue;
     }
 
-    if (markerCount === 0 && Buffer.byteLength(raw, 'utf8') >= PRESET_BLOCK_MIN_BYTES) {
+    if (hasMergedFloors && markerCount === 0 && Buffer.byteLength(raw, 'utf8') >= PRESET_BLOCK_MIN_BYTES) {
       if (floors.length === 0) {
         systemBlocks.push(trimmed);
       } else {
@@ -275,13 +274,193 @@ function chatKeys(messages) {
   };
 }
 
+function getRecordHashLists(rec) {
+  if (!rec || typeof rec !== 'object') return [];
+  const lists = [];
+  if (Array.isArray(rec.branches)) {
+    for (const b of rec.branches) {
+      if (b && typeof b === 'object') {
+        const h = Array.isArray(b.hashes)
+          ? b.hashes
+          : (Array.isArray(b.syncedHashes) ? b.syncedHashes : []);
+        if (h.length > 0) lists.push(h);
+      }
+    }
+  }
+  if (Array.isArray(rec.syncedHashes) && rec.syncedHashes.length > 0) {
+    lists.push(rec.syncedHashes);
+  } else if (Array.isArray(rec.hashes) && rec.hashes.length > 0) {
+    lists.push(rec.hashes);
+  }
+  return lists;
+}
+
+function getRecordKeys(key, rec) {
+  const set = new Set();
+  if (key) set.add(key);
+  if (rec && typeof rec === 'object') {
+    if (Array.isArray(rec.keys)) {
+      for (const k of rec.keys) {
+        if (k) set.add(k);
+      }
+    }
+    if (Array.isArray(rec.branches)) {
+      for (const b of rec.branches) {
+        if (b && Array.isArray(b.keys)) {
+          for (const k of b.keys) {
+            if (k) set.add(k);
+          }
+        }
+      }
+    }
+  }
+  return Array.from(set);
+}
+
+function normalizeBranch(key, b, parentRec, defaultBranchId = 'b1') {
+  const raw = (b && typeof b === 'object') ? b : {};
+  const branchId = (typeof raw.branchId === 'string' && raw.branchId.trim())
+    ? raw.branchId.trim()
+    : defaultBranchId;
+  const hashes = Array.isArray(raw.hashes)
+    ? raw.hashes.slice()
+    : (Array.isArray(raw.syncedHashes) ? raw.syncedHashes.slice() : []);
+  const parentKeys = (parentRec && Array.isArray(parentRec.keys) && parentRec.keys.length > 0)
+    ? parentRec.keys
+    : (key ? [key] : []);
+  const keys = (Array.isArray(raw.keys) && raw.keys.length > 0)
+    ? raw.keys.slice()
+    : parentKeys.slice();
+  const defaultDir = key
+    ? (branchId === 'b1' ? path.join(config.WORKSPACES, key) : path.join(config.WORKSPACES, key, branchId))
+    : '';
+  const dir = (typeof raw.dir === 'string' && raw.dir.trim())
+    ? raw.dir.trim()
+    : defaultDir;
+  const lastUsedAt = typeof raw.lastUsedAt === 'number'
+    ? raw.lastUsedAt
+    : (typeof raw.updatedAt === 'number'
+      ? raw.updatedAt
+      : (parentRec && typeof parentRec.updatedAt === 'number' ? parentRec.updatedAt : 0));
+
+  const out = {
+    branchId,
+    convId: raw.convId !== undefined ? raw.convId : null,
+    hashes,
+    turns: typeof raw.turns === 'number' ? raw.turns : 0,
+    dir,
+    model: (typeof raw.model === 'string' && raw.model.trim()) ? raw.model.trim() : config.DEFAULT_MODEL,
+    lastUsedAt,
+    swipeStreak: typeof raw.swipeStreak === 'number' ? raw.swipeStreak : 0,
+    keys,
+  };
+  if (typeof raw.numberedFloorCount === 'number') {
+    out.numberedFloorCount = raw.numberedFloorCount;
+  }
+  if (raw.conversationMissing) {
+    out.conversationMissing = Boolean(raw.conversationMissing);
+  }
+  if (raw.hasAppendedReply) {
+    out.hasAppendedReply = Boolean(raw.hasAppendedReply);
+  }
+  return out;
+}
+
+function migrateSessionRecord(key, rec) {
+  if (!rec || typeof rec !== 'object' || Array.isArray(rec)) return rec;
+  const keys = getRecordKeys(key, rec);
+  const updatedAt = typeof rec.updatedAt === 'number' ? rec.updatedAt : 0;
+
+  if (Array.isArray(rec.branches)) {
+    let branches = rec.branches
+      .filter((b) => b && typeof b === 'object')
+      .map((b, idx) => normalizeBranch(key, b, { ...rec, keys }, `b${idx + 1}`));
+    if (
+      branches.length === 0 &&
+      ('convId' in rec || Array.isArray(rec.syncedHashes) || Array.isArray(rec.hashes))
+    ) {
+      branches = [normalizeBranch(key, { ...rec, branchId: 'b1' }, { ...rec, keys }, 'b1')];
+    }
+    const lastBranchId = (typeof rec.lastBranchId === 'string' && branches.some((b) => b.branchId === rec.lastBranchId))
+      ? rec.lastBranchId
+      : (branches[0] ? branches[0].branchId : 'b1');
+    const out = {
+      branches,
+      lastBranchId,
+      keys,
+      updatedAt,
+    };
+    if (rec.sysHead) out.sysHead = rec.sysHead;
+    return out;
+  }
+
+  const hasLegacyData =
+    'convId' in rec ||
+    Array.isArray(rec.syncedHashes) ||
+    Array.isArray(rec.hashes) ||
+    typeof rec.turns === 'number' ||
+    typeof rec.dir === 'string';
+
+  const branches = hasLegacyData
+    ? [normalizeBranch(key, { ...rec, branchId: 'b1' }, { ...rec, keys }, 'b1')]
+    : [];
+
+  const out = {
+    branches,
+    lastBranchId: 'b1',
+    keys,
+    updatedAt,
+  };
+  if (rec.sysHead) out.sysHead = rec.sysHead;
+  return out;
+}
+
+/**
+ * 兼容镜像：把「最后使用分支」的关键字段回写到记录顶层。
+ * 旧工具 / 旧测试仍可读 rec.convId、rec.turns、rec.syncedHashes。
+ */
+function applyCompatMirror(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return state;
+  for (const key of Object.keys(state)) {
+    const rec = state[key];
+    if (!rec || typeof rec !== 'object' || !Array.isArray(rec.branches) || rec.branches.length === 0) continue;
+    const last = rec.branches.find((b) => b && b.branchId === rec.lastBranchId) || rec.branches[rec.branches.length - 1];
+    if (!last) continue;
+    if (last.convId != null) rec.convId = last.convId;
+    if (typeof last.turns === 'number') rec.turns = last.turns;
+    if (Array.isArray(last.hashes)) rec.syncedHashes = last.hashes.slice();
+    if (!rec.dir && last.dir) rec.dir = last.dir;
+    if (!rec.model && last.model) rec.model = last.model;
+    if (typeof last.swipeStreak === 'number') rec.swipeStreak = last.swipeStreak;
+  }
+  return state;
+}
+
+function migrateState(state) {
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return {};
+  const out = {};
+  for (const [k, rec] of Object.entries(state)) {
+    if (rec && typeof rec === 'object' && !Array.isArray(rec)) {
+      out[k] = migrateSessionRecord(k, rec);
+    }
+  }
+  return applyCompatMirror(out);
+}
+
 function findBySingleKey(state, targetKey) {
   if (!state || typeof state !== 'object' || !targetKey) return null;
   if (state[targetKey] && typeof state[targetKey] === 'object') {
     return { key: targetKey, sess: state[targetKey] };
   }
   for (const [k, rec] of Object.entries(state)) {
-    if (rec && typeof rec === 'object' && Array.isArray(rec.keys) && rec.keys.includes(targetKey)) {
+    if (!rec || typeof rec !== 'object') continue;
+    if (Array.isArray(rec.keys) && rec.keys.includes(targetKey)) {
+      return { key: k, sess: rec };
+    }
+    if (
+      Array.isArray(rec.branches) &&
+      rec.branches.some((b) => b && Array.isArray(b.keys) && b.keys.includes(targetKey))
+    ) {
       return { key: k, sess: rec };
     }
   }
@@ -315,12 +494,15 @@ function resolveSession(state, messages) {
   if (!hit && floors.length >= 2) {
     const pHit = findBySingleKey(safeState, primary);
     if (pHit && pHit.sess) {
-      const recKeys = Array.isArray(pHit.sess.keys) ? pHit.sess.keys : [pHit.key];
+      const recKeys = getRecordKeys(pHit.key, pHit.sess);
       const hasCommittedSecond = recKeys.some((k) => k !== primary && k !== initAlias);
       if (!hasCommittedSecond) {
         const hashes = floors.map(layerHash);
-        const synced = Array.isArray(pHit.sess.syncedHashes) ? pHit.sess.syncedHashes : [];
-        if (synced.length < 2 || (synced[0] === hashes[0] && synced[1] === hashes[1])) {
+        const hashLists = getRecordHashLists(pHit.sess);
+        if (
+          hashLists.length === 0 ||
+          hashLists.some((synced) => synced.length < 2 || (synced[0] === hashes[0] && synced[1] === hashes[1]))
+        ) {
           hit = pHit;
           hitBy = 'primary';
         }
@@ -332,32 +514,43 @@ function resolveSession(state, messages) {
   if (!hit && floors.length > 0) {
     const hashes = floors.map(layerHash);
     for (const [k, rec] of Object.entries(safeState)) {
-      if (!rec || typeof rec !== 'object' || !Array.isArray(rec.syncedHashes) || rec.syncedHashes.length === 0) {
-        continue;
-      }
-      if (rec.syncedHashes[0] !== hashes[0]) continue;
-      if (hashes.length >= 2 && rec.syncedHashes.length >= 2) {
-        if (rec.syncedHashes[1] === hashes[1]) {
+      if (!rec || typeof rec !== 'object') continue;
+      const hashLists = getRecordHashLists(rec);
+      if (hashLists.length === 0) continue;
+      let matched = false;
+      for (const synced of hashLists) {
+        if (!Array.isArray(synced) || synced.length === 0) continue;
+        if (synced[0] !== hashes[0]) continue;
+        if (hashes.length >= 2 && synced.length >= 2) {
+          if (synced[1] === hashes[1]) {
+            hit = { key: k, sess: rec };
+            hitBy = 'alias';
+            matched = true;
+            break;
+          }
+          continue;
+        }
+        const sysGrowMatch = hashes.length < 2 && synced.length < 2
+          && typeof rec.sysHead === 'string' && rec.sysHead.length > 0 && sysText.includes(rec.sysHead);
+        if (sysGrowMatch) {
           hit = { key: k, sess: rec };
-          hitBy = 'alias';
+          hitBy = 'primary';
+          matched = true;
           break;
         }
-        continue;
       }
-      const sysGrowMatch = hashes.length < 2 && rec.syncedHashes.length < 2
-        && typeof rec.sysHead === 'string' && rec.sysHead.length > 0 && sysText.includes(rec.sysHead);
-      if (sysGrowMatch) {
-        hit = { key: k, sess: rec };
-        hitBy = 'primary';
-        break;
-      }
+      if (matched) break;
     }
   }
 
   if (hit && hit.sess) {
-    if (!Array.isArray(hit.sess.keys)) {
-      hit.sess.keys = [hit.key];
-    }
+    const migrated = migrateSessionRecord(hit.key, hit.sess);
+    hit.sess.branches = migrated.branches;
+    hit.sess.lastBranchId = migrated.lastBranchId;
+    hit.sess.keys = migrated.keys;
+    hit.sess.updatedAt = migrated.updatedAt;
+    if (migrated.sysHead) hit.sess.sysHead = migrated.sysHead;
+
     const pOwner = findBySingleKey(safeState, primary);
     if ((!pOwner || pOwner.sess === hit.sess) && !hit.sess.keys.includes(primary)) {
       hit.sess.keys.push(primary);
@@ -365,6 +558,15 @@ function resolveSession(state, messages) {
     const aOwner = findBySingleKey(safeState, alias);
     if ((!aOwner || aOwner.sess === hit.sess) && !hit.sess.keys.includes(alias)) {
       hit.sess.keys.push(alias);
+    }
+    if (Array.isArray(hit.sess.branches)) {
+      for (const b of hit.sess.branches) {
+        if (!b || typeof b !== 'object') continue;
+        if (!Array.isArray(b.keys)) b.keys = [];
+        for (const k of hit.sess.keys) {
+          if (!b.keys.includes(k)) b.keys.push(k);
+        }
+      }
     }
     return {
       key: hit.key,
@@ -409,21 +611,47 @@ function loadState() {
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      memoryStateByFile.set(file, JSON.parse(JSON.stringify(parsed)));
-      return JSON.parse(JSON.stringify(parsed));
+      const migrated = migrateState(parsed);
+      memoryStateByFile.set(file, JSON.parse(JSON.stringify(migrated)));
+      return JSON.parse(JSON.stringify(migrated));
     }
     return {};
-  } catch {
-    if (!fs.existsSync(file) && memoryStateByFile.has(file)) {
-      return JSON.parse(JSON.stringify(memoryStateByFile.get(file)));
+  } catch (err) {
+    if (memoryStateByFile.has(file)) {
+      const cached = migrateState(memoryStateByFile.get(file));
+      return JSON.parse(JSON.stringify(cached));
     }
+    try {
+      if (fs.existsSync(file)) {
+        const bak = `${file}.corrupt.${Date.now()}`;
+        fs.copyFileSync(file, bak);
+      }
+    } catch {}
   }
   return {};
 }
 
 function saveState(state) {
   const file = config.STATE_FILE;
-  const safeState = (state && typeof state === 'object' && !Array.isArray(state)) ? state : {};
+  const safeState = (state && typeof state === 'object' && !Array.isArray(state))
+    ? migrateState(state)
+    : {};
+
+  /* 兼容镜像：顶层保留最后使用分支的关键字段。
+     外部工具 / 旧版审计脚本仍可读 rec.convId、rec.turns、rec.syncedHashes；
+     migrateSessionRecord 优先识别 branches，因此镜像字段不会被重复迁移。 */
+  for (const key of Object.keys(safeState)) {
+    const rec = safeState[key];
+    if (!rec || typeof rec !== 'object' || !Array.isArray(rec.branches) || rec.branches.length === 0) continue;
+    const last = rec.branches.find((b) => b && b.branchId === rec.lastBranchId) || rec.branches[rec.branches.length - 1];
+    if (!last) continue;
+    rec.convId = last.convId != null ? last.convId : rec.convId;
+    rec.turns = typeof last.turns === 'number' ? last.turns : rec.turns;
+    rec.syncedHashes = Array.isArray(last.hashes) ? last.hashes.slice() : (rec.syncedHashes || []);
+    if (!rec.dir && last.dir) rec.dir = last.dir;
+    if (!rec.model && last.model) rec.model = last.model;
+    if (typeof last.swipeStreak === 'number') rec.swipeStreak = last.swipeStreak;
+  }
   memoryStateByFile.set(file, JSON.parse(JSON.stringify(safeState)));
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -452,6 +680,17 @@ function normalizeFloorsForDrift(input) {
   return { floors, hashes: floors.map(layerHash) };
 }
 
+function calcLcp(a, b) {
+  const arrA = Array.isArray(a) ? a : [];
+  const arrB = Array.isArray(b) ? b : [];
+  const minLen = Math.min(arrA.length, arrB.length);
+  let i = 0;
+  while (i < minLen && arrA[i] === arrB[i]) {
+    i++;
+  }
+  return i;
+}
+
 /**
  * N3: 四态漂移判定（基于 floors 的哈希数组）：
  * - 全部哈希相等且长度相等 → { kind: 'retry', divIdx }
@@ -464,7 +703,18 @@ function driftOf(sess, messagesOrFloors) {
   if (!sess || typeof sess !== 'object') {
     return { kind: 'deep', divIdx: 0 };
   }
-  const synced = Array.isArray(sess.syncedHashes) ? sess.syncedHashes : [];
+  let target = sess;
+  if (
+    !Array.isArray(sess.hashes) &&
+    !Array.isArray(sess.syncedHashes) &&
+    Array.isArray(sess.branches) &&
+    sess.branches.length > 0
+  ) {
+    target = sess.branches.find((b) => b && b.branchId === sess.lastBranchId) || sess.branches[0];
+  }
+  const synced = Array.isArray(target.hashes)
+    ? target.hashes
+    : (Array.isArray(target.syncedHashes) ? target.syncedHashes : []);
   if (synced.length === 0) {
     return { kind: 'deep', divIdx: 0 };
   }
@@ -474,16 +724,12 @@ function driftOf(sess, messagesOrFloors) {
     return { kind: 'deep', divIdx: 0 };
   }
 
-  let divIdx = 0;
-  const minLen = Math.min(synced.length, hashes.length);
-  while (divIdx < minLen && synced[divIdx] === hashes[divIdx]) {
-    divIdx++;
-  }
+  const divIdx = calcLcp(synced, hashes);
 
-  if (('convId' in sess && !sess.convId) || sess.conversationMissing) {
+  if (('convId' in target && !target.convId) || target.conversationMissing) {
     return { kind: 'deep', divIdx };
   }
-  if (typeof sess.turns === 'number' && sess.turns >= config.MAX_TURNS_PER_SESSION) {
+  if (typeof target.turns === 'number' && target.turns >= config.MAX_TURNS_PER_SESSION) {
     return { kind: 'deep', divIdx };
   }
 
@@ -498,16 +744,20 @@ function driftOf(sess, messagesOrFloors) {
   // 预设楼层合并场景：上一轮已合并的所有「（第N楼）」均完整匹配，且本轮在 divIdx 处新增了合并后的「（第N+1楼）」
   if (
     divIdx > 0 &&
-    typeof sess.numberedFloorCount === 'number' &&
-    sess.numberedFloorCount > 0 &&
-    divIdx >= sess.numberedFloorCount &&
     floors.length > divIdx &&
     FLOOR_MARKER_HEAD_RE.test(textOf(floors[divIdx].content))
   ) {
     const currentNumbered = floors.filter((f) => FLOOR_MARKER_HEAD_RE.test(textOf(f.content))).length;
-    if (currentNumbered > sess.numberedFloorCount) {
+    const prevNumbered = (typeof target.numberedFloorCount === 'number' && target.numberedFloorCount > 0)
+      ? target.numberedFloorCount
+      : (FLOOR_MARKER_HEAD_RE.test(textOf(floors[0].content)) && (synced.length - divIdx <= 2) ? divIdx : 0);
+    if (prevNumbered > 0 && divIdx >= prevNumbered && currentNumbered > prevNumbered) {
       return { kind: 'advance', divIdx };
     }
+  }
+
+  if (target.hasAppendedReply && divIdx === hashes.length && synced.length === hashes.length + 1) {
+    return { kind: 'retry', divIdx };
   }
 
   if (divIdx === hashes.length && hashes.length < synced.length) {
@@ -515,12 +765,228 @@ function driftOf(sess, messagesOrFloors) {
   }
 
   const depth = synced.length - divIdx;
-  const swipeStreak = typeof sess.swipeStreak === 'number' ? sess.swipeStreak : 0;
+  const swipeStreak = typeof target.swipeStreak === 'number' ? target.swipeStreak : 0;
   if (depth <= config.MAX_DRIFT_FLOORS && swipeStreak < config.MAX_SWIPE_STREAK) {
     return { kind: 'shallow', divIdx };
   }
 
   return { kind: 'deep', divIdx };
+}
+
+function copyTimelineBeforeLcp(parentDir, newDir, lcp) {
+  if (!newDir) return false;
+  try {
+    fs.mkdirSync(newDir, { recursive: true });
+    if (!parentDir) return false;
+    const srcPath = path.join(parentDir, 'timeline.md');
+    if (!fs.existsSync(srcPath)) return false;
+    const raw = fs.readFileSync(srcPath, 'utf8');
+    const re = /<!--\s*floor:\s*(\d+)\s*-->/g;
+    const matches = [];
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      matches.push({
+        floor: Number(m[1]),
+        start: m.index,
+        bodyStart: m.index + m[0].length,
+      });
+    }
+    const maxFloor = Number(lcp) || 0;
+    const kept = [];
+    for (let i = 0; i < matches.length; i++) {
+      const cur = matches[i];
+      const nextStart = i + 1 < matches.length ? matches[i + 1].start : raw.length;
+      const body = raw.slice(cur.bodyStart, nextStart).trim();
+      if (cur.floor < maxFloor) {
+        kept.push(`<!-- floor: ${cur.floor} -->\n${body}`);
+      }
+    }
+    const out = kept.length > 0 ? kept.join('\n\n') + '\n' : '';
+    const dstPath = path.join(newDir, 'timeline.md');
+    const tmpPath = `${dstPath}.tmp.${process.pid}.${++seq}`;
+    fs.writeFileSync(tmpPath, out, 'utf8');
+    fs.renameSync(tmpPath, dstPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const MAX_BRANCHES_PER_CHAT = 4;
+
+/**
+ * 分支选择算法（多分支桶 + LCP 选择）：
+ * 1. 算 incomingHashes（按 splitFloors 的 floors 哈希）。
+ * 2. 对每个 branch 算 lcp = 公共前缀长度，并用 driftOf 判断 kind。
+ * 3. 优先选 kind 为 advance / retry 或 shallow 且 lcp 最大的分支（branchAction = 'reuse'）。
+ * 4. 若无分支（首次会话）→ 新建 b1（branchAction = 'new'）；
+ *    若所有已有分支都是 deep → 取 lcp 最大的作为父分支，新建 b(max+1)，dir = <WORKSPACES>/<chatKey>/<branchId>，
+ *    复制父分支 timeline.md 中 floor < lcp 的条目到新分支目录，超过 4 个分支时淘汰 lastUsedAt 最旧的分支（branchAction = 'fork'）。
+ * 5. 更新选中分支的 lastUsedAt 及记录的 lastBranchId。
+ */
+function selectBranch(sessRecord, messagesOrFloors, opts = {}) {
+  const key = (typeof opts.chatKey === 'string' && opts.chatKey) ? opts.chatKey : '';
+  const workspacesDir = opts.workspacesDir || config.WORKSPACES;
+  const model = (typeof opts.model === 'string' && opts.model.trim()) ? opts.model.trim() : config.DEFAULT_MODEL;
+  const now = typeof opts.now === 'number' ? opts.now : Date.now();
+  const isHealthy = typeof opts.isHealthy === 'function' ? opts.isHealthy : null;
+  const { floors, hashes: incomingHashes } = normalizeFloorsForDrift(messagesOrFloors);
+
+  const migrated = (sessRecord && typeof sessRecord === 'object')
+    ? migrateSessionRecord(key, sessRecord)
+    : null;
+  const defaultKeys = Array.isArray(opts.keys) && opts.keys.length > 0
+    ? opts.keys.slice()
+    : ((migrated && Array.isArray(migrated.keys) && migrated.keys.length > 0)
+      ? migrated.keys.slice()
+      : (key ? [key] : []));
+
+  const existingBranches = (migrated && Array.isArray(migrated.branches))
+    ? migrated.branches.filter((b) => b && ((Array.isArray(b.hashes) && b.hashes.length > 0) || b.convId))
+    : [];
+
+  if (existingBranches.length === 0) {
+    const b1Dir = key ? path.join(workspacesDir, key) : '';
+    const b1 = {
+      branchId: 'b1',
+      convId: null,
+      hashes: [],
+      turns: 0,
+      dir: b1Dir,
+      model,
+      lastUsedAt: now,
+      swipeStreak: 0,
+      keys: defaultKeys.slice(),
+    };
+    const branches = [b1];
+    if (sessRecord && typeof sessRecord === 'object') {
+      sessRecord.branches = branches;
+      sessRecord.lastBranchId = 'b1';
+    }
+    return {
+      branch: b1,
+      branches,
+      branchId: 'b1',
+      branchCount: 1,
+      lcp: 0,
+      branchAction: 'new',
+      drift: { kind: 'deep', divIdx: 0 },
+      parentBranch: null,
+    };
+  }
+
+  const evaluated = existingBranches.map((b) => {
+    const branchHashes = Array.isArray(b.hashes)
+      ? b.hashes
+      : (Array.isArray(b.syncedHashes) ? b.syncedHashes : []);
+    const lcp = calcLcp(branchHashes, incomingHashes);
+    const healthy = !isHealthy || !b.convId || isHealthy(b.convId);
+    const bForDrift = {
+      ...b,
+      hashes: branchHashes,
+      syncedHashes: branchHashes,
+      convId: healthy ? b.convId : null,
+    };
+    const drift = driftOf(bForDrift, floors.length > 0 ? floors : incomingHashes);
+    return { branch: b, lcp, drift };
+  });
+
+  const reusable = evaluated.filter(
+    (e) => e.drift.kind === 'advance' || e.drift.kind === 'shallow' || e.drift.kind === 'retry'
+  );
+
+  if (reusable.length > 0) {
+    reusable.sort((a, b) => {
+      if (b.lcp !== a.lcp) return b.lcp - a.lcp;
+      const aShallow = a.drift.kind === 'shallow' ? 1 : 0;
+      const bShallow = b.drift.kind === 'shallow' ? 1 : 0;
+      if (aShallow !== bShallow) return aShallow - bShallow;
+      return (b.branch.lastUsedAt || 0) - (a.branch.lastUsedAt || 0);
+    });
+    const winner = reusable[0];
+    winner.branch.lastUsedAt = now;
+    if (sessRecord && typeof sessRecord === 'object') {
+      sessRecord.branches = existingBranches;
+      sessRecord.lastBranchId = winner.branch.branchId;
+    }
+    return {
+      branch: winner.branch,
+      branches: existingBranches,
+      branchId: winner.branch.branchId,
+      branchCount: existingBranches.length,
+      lcp: winner.lcp,
+      branchAction: 'reuse',
+      drift: winner.drift,
+      parentBranch: null,
+    };
+  }
+
+  // 所有分支都是 deep：选 lcp 最大的作为父分支，新建 b(max+1)
+  const byLcp = evaluated.slice().sort((a, b) => {
+    if (b.lcp !== a.lcp) return b.lcp - a.lcp;
+    return (b.branch.lastUsedAt || 0) - (a.branch.lastUsedAt || 0);
+  });
+  const parent = byLcp[0];
+
+  let maxNum = 0;
+  for (const b of existingBranches) {
+    const m = /^b(\d+)$/i.exec(String((b && b.branchId) || ''));
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > maxNum) maxNum = n;
+    }
+  }
+  const newBranchId = `b${maxNum + 1}`;
+  const newDir = key ? path.join(workspacesDir, key, newBranchId) : '';
+
+  copyTimelineBeforeLcp(parent.branch.dir, newDir, parent.lcp);
+
+  const newBranch = {
+    branchId: newBranchId,
+    convId: null,
+    hashes: [],
+    turns: 0,
+    dir: newDir,
+    model,
+    lastUsedAt: now,
+    swipeStreak: 0,
+    keys: defaultKeys.slice(),
+  };
+
+  const nextBranches = [...existingBranches, newBranch];
+  while (nextBranches.length > MAX_BRANCHES_PER_CHAT) {
+    let oldestIdx = -1;
+    let oldestTime = Infinity;
+    for (let i = 0; i < nextBranches.length; i++) {
+      if (nextBranches[i].branchId === newBranchId) continue;
+      const t = typeof nextBranches[i].lastUsedAt === 'number' ? nextBranches[i].lastUsedAt : 0;
+      if (t < oldestTime) {
+        oldestTime = t;
+        oldestIdx = i;
+      }
+    }
+    if (oldestIdx >= 0) {
+      nextBranches.splice(oldestIdx, 1);
+    } else {
+      break;
+    }
+  }
+
+  if (sessRecord && typeof sessRecord === 'object') {
+    sessRecord.branches = nextBranches;
+    sessRecord.lastBranchId = newBranchId;
+  }
+
+  return {
+    branch: newBranch,
+    branches: nextBranches,
+    branchId: newBranchId,
+    branchCount: nextBranches.length,
+    lcp: parent.lcp,
+    branchAction: 'fork',
+    drift: { kind: 'deep', divIdx: parent.lcp },
+    parentBranch: parent.branch,
+  };
 }
 
 const DEFAULT_ARCHIVE_INSTRUCTION =
@@ -538,6 +1004,27 @@ const DEFAULT_ARCHIVE_INSTRUCTION =
  * - [RECENT] = 从尾部装 floors，单条上限 40KB（保头尾）
  * - N7: 若 floors.length === 0，退回旧行为：把 systemBlocks 当 system、postBlocks 当 user，不要崩
  */
+function isStrictSystem() {
+  return Boolean(config.STRICT_SYSTEM || config.AGY_STRICT_SYSTEM || process.env.AGY_STRICT_SYSTEM === '1');
+}
+
+/**
+ * 严格模式预算检查：[SYSTEM]+[STATE] 超过预算 60% 时抛出 system_budget_exceeded。
+ * 非严格模式直接返回。
+ */
+function checkStrictSystemBudget({ system = '', systemBlocks = [], state = '', budgetBytes } = {}) {
+  if (!isStrictSystem()) return true;
+  const budget = Number(budgetBytes) > 0 ? Number(budgetBytes) : config.PROMPT_BUDGET;
+  const blocks = (Array.isArray(systemBlocks) ? systemBlocks : []).map((b) => textOf(b)).filter(Boolean).join('\n\n');
+  const head = [String(system || ''), blocks].filter(Boolean).join('\n\n');
+  const bytes = Buffer.byteLength(head + '\n\n' + String(state || ''), 'utf8');
+  const cap = Math.floor(budget * 0.6);
+  if (bytes > cap) {
+    throw new Error('system_budget_exceeded: [SYSTEM]+[STATE] ' + bytes + 'B > ' + cap + 'B');
+  }
+  return true;
+}
+
 function buildBootstrap({
   system = '',
   messages = [],
@@ -545,6 +1032,8 @@ function buildBootstrap({
   systemBlocks: sysBlocksOpt,
   postBlocks: postBlocksOpt,
   timeline = '',
+  state = '',
+  chapters = '',
   budgetBytes = config.PROMPT_BUDGET,
 } = {}) {
   const budget = Number(budgetBytes) > 0 ? Number(budgetBytes) : config.PROMPT_BUDGET;
@@ -596,6 +1085,10 @@ function buildBootstrap({
     sysText = sysText ? (sysText + DEFAULT_ARCHIVE_INSTRUCTION) : DEFAULT_ARCHIVE_INSTRUCTION.trim();
   }
 
+  if (config.NON_CODING_FRAME && !sysText.startsWith(config.NON_CODING_FRAME)) {
+    sysText = config.NON_CODING_FRAME + '\n' + sysText;
+  }
+
   const openingMsgs = activeFloors.slice(0, 2);
   const recentCandidates = activeFloors.slice(2);
 
@@ -605,14 +1098,30 @@ function buildBootstrap({
   const timelineText = typeof timeline === 'string' ? timeline : String(timeline || '');
   const postText = activePostBlocks.map((b) => textOf(b).trim()).filter(Boolean).join('\n\n');
 
+  const stateText = typeof state === 'string' ? state : String(state || '');
+  const chaptersText = typeof chapters === 'string' ? chapters : String(chapters || '');
+
   let sysSection = `[SYSTEM]\n${sysText}`;
   let openingSection = `[OPENING]\n${openingBlock}`;
+  let stateSection = stateText.trim() ? `[STATE]\n${stateText.trim()}` : '';
+  let chaptersSection = chaptersText.trim() ? `[CHAPTERS]\n${chaptersText.trim()}` : '';
   let timelineSection = `[TIMELINE]\n${timelineText}`;
+
+  /* 严格模式：[SYSTEM]+[STATE] 超过预算 60% 直接失败，绝不静默砍系统提示 */
+  if (isStrictSystem()) {
+    const headBytes = Buffer.byteLength(`${sysSection}\n\n${stateSection}`, 'utf8');
+    if (headBytes > Math.floor(budget * 0.6)) {
+      throw new Error('system_budget_exceeded: [SYSTEM]+[STATE] ' + headBytes + 'B > ' + Math.floor(budget * 0.6) + 'B');
+    }
+  }
   let postSection = postText ? `[POST]\n${postText}` : '';
   const recentHeader = '[RECENT]\n';
 
   const assemblePrefix = () => {
-    const sections = [sysSection, openingSection, timelineSection];
+    const sections = [sysSection, openingSection];
+    if (stateSection) sections.push(stateSection);
+    if (chaptersSection) sections.push(chaptersSection);
+    sections.push(timelineSection);
     if (postSection) sections.push(postSection);
     return `${sections.join('\n\n')}\n\n${recentHeader}`;
   };
@@ -725,6 +1234,8 @@ function buildOverride({ divIdx = 0, floors, messages = [] } = {}) {
 }
 
 module.exports = {
+  checkStrictSystemBudget,
+  isStrictSystem,
   splitFloors,
   chatKey,
   aliasKey,
@@ -733,6 +1244,11 @@ module.exports = {
   loadState,
   saveState,
   driftOf,
+  selectBranch,
+  migrateSessionRecord,
+  migrateState,
+  copyTimelineBeforeLcp,
+  calcLcp,
   buildBootstrap,
   buildOverride,
   layerHash,

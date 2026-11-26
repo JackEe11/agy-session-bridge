@@ -83,6 +83,9 @@ function terminateChild(child, graceMs = 3000) {
         } catch {}
       }
     }, waitMs);
+    if (typeof child.__agyKillTimer.unref === 'function') {
+      child.__agyKillTimer.unref();
+    }
   }
 }
 
@@ -107,7 +110,14 @@ if (cp.ChildProcess && cp.ChildProcess.prototype && !cp.ChildProcess.prototype._
  * @returns {{cmd: string, args: string[]}}
  */
 function binSpec(bin, args = []) {
-  const viaNode = process.platform === 'win32' && /\.(c|m)?js$/i.test(bin);
+  let viaNode = process.platform === 'win32' && /\.(c|m)?js$/i.test(bin);
+  if (!viaNode && /\.(c|m)?js$/i.test(bin)) {
+    try {
+      fs.accessSync(bin, fs.constants.X_OK);
+    } catch {
+      viaNode = true;
+    }
+  }
   return viaNode
     ? { cmd: process.execPath, args: [bin, ...args] }
     : { cmd: bin, args };
@@ -181,7 +191,8 @@ function runTurn(opts = {}) {
     }
 
     const bin = process.env.AGY_BIN || config.AGY_BIN;
-    const env = { ...process.env, HOME: config.HOME, ELECTRON_RUN_AS_NODE: '' };
+    const env = { ...process.env, HOME: config.HOME };
+    delete env.ELECTRON_RUN_AS_NODE;
     if (config.COMPACT_OVERRIDE) {
       env.AGY_CLI_AUTO_COMPACT_OVERRIDE = config.COMPACT_OVERRIDE;
     }
@@ -300,6 +311,8 @@ function runTurn(opts = {}) {
     const stdoutDecoder = new StringDecoder('utf8');
     const stderrDecoder = new StringDecoder('utf8');
 
+    let stderrTail = '';
+
     function processStdoutStr(str) {
       if (!str) return;
       rawStdout += str;
@@ -310,7 +323,7 @@ function runTurn(opts = {}) {
         lineBuf = lineBuf.slice(idx + 1);
         handleLine(line);
       }
-      if (checkMissingWarning(lineBuf) || checkMissingWarning(rawStdout)) {
+      if (checkMissingWarning(lineBuf)) {
         triggerMissing();
       }
     }
@@ -323,7 +336,8 @@ function runTurn(opts = {}) {
     child.stderr.on('data', (chunk) => {
       const str = typeof chunk === 'string' ? chunk : stderrDecoder.write(chunk);
       stderr += str;
-      if (checkMissingWarning(str) || checkMissingWarning(stderr)) {
+      stderrTail = (stderrTail + str).slice(-512);
+      if (checkMissingWarning(str) || checkMissingWarning(stderrTail)) {
         triggerMissing();
       }
     });

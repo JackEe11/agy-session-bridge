@@ -40,7 +40,7 @@ function ensureArchiveSystem(sysText) {
 
 const TOKEN_FILE = process.env.AGY_BRIDGE_TOKEN_FILE || path.join(config.HOME, '.agy-bridge', 'token');
 const SUMMARY_FILE = process.env.AGY_SUMMARY_FILE || path.join(config.HOME, '.agy-bridge', 'summaries.json');
-const SUMMARY_MODEL = process.env.AGY_SUMMARY_MODEL || 'gemini-3.8-flash-low';
+const SUMMARY_MODEL = process.env.AGY_SUMMARY_MODEL || config.SUMMARY_MODEL || 'gemini-3.8-flash-low';
 const SUMMARY_REFRESH_STEP = Number(process.env.AGY_SUMMARY_STEP || 4);
 const SUMMARY_MAX_INPUT = 80000;
 
@@ -83,12 +83,15 @@ function trySeedTimeline(workspaceDir, floors) {
     const firstTrimmed = firstContent.trim();
     if (!firstTrimmed) return false;
 
-    let seedsDir = path.join(config.WORKSPACES, '_seeds');
-    const parentSeedsDir = path.join(path.dirname(workspaceDir), '_seeds');
-    if (parentSeedsDir !== seedsDir && fs.existsSync(parentSeedsDir)) {
-      seedsDir = parentSeedsDir;
-    }
-    if (!fs.existsSync(seedsDir)) return false;
+    const candidateSeedsDirs = [
+      path.join(path.dirname(workspaceDir), '_seeds'),
+      path.join(path.dirname(path.dirname(workspaceDir)), '_seeds'),
+      path.join(config.WORKSPACES, '_seeds'),
+    ];
+    const seedsDir = candidateSeedsDirs.find((d) => {
+      try { return fs.existsSync(d); } catch { return false; }
+    });
+    if (!seedsDir) return false;
 
     const entries = fs.readdirSync(seedsDir).sort();
     for (const file of entries) {
@@ -155,18 +158,22 @@ function tailUtf8(str, maxBytes) {
 
 /* ---- Dynamic models list (10-minute cache) ---- */
 let modelsCacheAt = 0;
+let modelsInFlight = false;
 
 function refreshModels() {
   const now = Date.now();
+  if (modelsInFlight) return;
   if (now - modelsCacheAt < 10 * 60 * 1000 && MODELS.length > 0 && modelsCacheAt > 0) {
     return;
   }
+  modelsInFlight = true;
   const spec = binSpec(process.env.AGY_BIN || config.AGY_BIN, ['models']);
   execFile(
     spec.cmd,
     spec.args,
     { cwd: ensureSysWorkspace(), env: { ...process.env, HOME: config.HOME }, timeout: 60000 },
     (err, stdout) => {
+      modelsInFlight = false;
       if (err) {
         log('refreshModels failed:', String(err.message).slice(0, 120));
         return;
@@ -194,13 +201,19 @@ setInterval(refreshModels, 10 * 60 * 1000).unref();
 
 /* ---- Quota inquiry (60-second cache) ---- */
 let quotaCache = { at: 0, text: '', parsed: [] };
+let quotaInFlight = null;
 
 function runQuota() {
-  return new Promise((resolve) => {
-    const now = Date.now();
-    if (now - quotaCache.at < 60000 && quotaCache.text) {
-      return resolve(quotaCache);
-    }
+  const now = Date.now();
+  if (now - quotaCache.at < 60000 && quotaCache.text) {
+    return Promise.resolve(quotaCache);
+  }
+  if (quotaInFlight) return quotaInFlight;
+  quotaInFlight = new Promise((resolve) => {
+    const done = (val) => {
+      quotaInFlight = null;
+      resolve(val);
+    };
     const spec = binSpec(process.env.AGY_BIN || config.AGY_BIN, ['-p', '/quota', '--print-timeout', '45s']);
     let child;
     try {
@@ -211,7 +224,7 @@ function runQuota() {
       });
     } catch (e) {
       quotaCache = { at: now, text: String(e.message), parsed: [] };
-      return resolve(quotaCache);
+      return done(quotaCache);
     }
     const outChunks = [];
     const errChunks = [];
@@ -241,14 +254,15 @@ function runQuota() {
         }
       }
       quotaCache = { at: now, text: (out || err).trim(), parsed };
-      resolve(quotaCache);
+      done(quotaCache);
     });
     child.on('error', (e) => {
       clearTimeout(timer);
       quotaCache = { at: now, text: String(e.message), parsed: [] };
-      resolve(quotaCache);
+      done(quotaCache);
     });
   });
+  return quotaInFlight;
 }
 
 /* ---- Effort & fallback helpers ---- */
@@ -264,10 +278,10 @@ function mapEffort(v) {
   return '';
 }
 
-function pickFallback(model, errText) {
+function pickFallback(model, errText, tried = null) {
   const msg = String(errText || '');
   if (!RETRYABLE_ERR.test(msg)) return '';
-  return (config.FALLBACK_MODELS || []).find((m) => m !== model) || '';
+  return (config.FALLBACK_MODELS || []).find((m) => m !== model && (!tried || !tried.has(m))) || '';
 }
 
 function sseChunk(res, model, delta, finish) {
@@ -406,7 +420,9 @@ function saveSummaries() {
   if (!summaryDirty) return;
   try {
     fs.mkdirSync(path.dirname(SUMMARY_FILE), { recursive: true });
-    fs.writeFileSync(SUMMARY_FILE, JSON.stringify(summaries));
+    const tmpSum = `${SUMMARY_FILE}.tmp.${process.pid}.${Date.now()}`;
+    fs.writeFileSync(tmpSum, JSON.stringify(summaries), 'utf8');
+    fs.renameSync(tmpSum, SUMMARY_FILE);
     summaryDirty = false;
   } catch (e) {
     log('summary save failed', String(e.message).slice(0, 120));
@@ -446,6 +462,9 @@ function buildStatelessPrompt(messages, summary) {
 
   let head = sysFull ? '【设定与规则】\n' + sysFull : '';
   const budget = config.PROMPT_BUDGET;
+  if (session.isStrictSystem() && Buffer.byteLength(head, 'utf8') > Math.floor(budget * 0.6)) {
+    throw new Error('system_budget_exceeded: system prompt exceeds 60% of budget');
+  }
   const sizeOf = (h, arr, omitted) => Buffer.byteLength(assembleStateless(h, arr, omitted, summary), 'utf8');
 
   let omitted = 0;
@@ -535,6 +554,11 @@ function isTranscriptHealthy(convId) {
       // defer to agy's "warning: conversation ... not found" detection.
       return true;
     }
+    const directTranscript = path.join(brainConvDir, '.system_generated', 'logs', 'transcript.jsonl');
+    if (fs.existsSync(directTranscript)) {
+      const st = fs.statSync(directTranscript);
+      if (st.isFile() && st.size > 0) return true;
+    }
     const transcriptDir = path.join(brainConvDir, '.system_generated', 'logs', 'chunks', 'transcript');
     if (!fs.existsSync(transcriptDir)) return false;
     const files = fs.readdirSync(transcriptDir);
@@ -569,10 +593,16 @@ const server = http.createServer((req, res) => {
   }
 
   const remote = (req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : '').replace('::ffff:', '');
-  const isLoopback = !remote || remote === '127.0.0.1' || remote === '::1';
-  if (AUTH_TOKEN && !isLoopback) {
+  const isLoopback = remote === '127.0.0.1' || remote === '::1';
+  if (!isLoopback) {
+    if (!AUTH_TOKEN) {
+      res.writeHead(403, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ error: { message: 'non-loopback access requires bridge token', type: 'invalid_request_error' } }));
+    }
     const got = (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
-    if (got !== AUTH_TOKEN) {
+    const a = Buffer.from(got, 'utf8');
+    const b = Buffer.from(AUTH_TOKEN, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       res.writeHead(401, { 'content-type': 'application/json' });
       return res.end(JSON.stringify({ error: { message: 'invalid api key', type: 'invalid_request_error' } }));
     }
@@ -614,6 +644,9 @@ const server = http.createServer((req, res) => {
         created: 0,
         owned_by: 'antigravity',
         name: MODEL_NAMES[id] || id,
+        context_length: 1000000,
+        context_window: 1000000,
+        max_context_length: 1000000,
       })),
     }));
   }
@@ -629,10 +662,26 @@ const server = http.createServer((req, res) => {
   });
 
   const reqChunks = [];
+  let reqBytes = 0;
+  let bodyTooLarge = false;
+  req.on('error', () => {
+    ac.abort();
+  });
   req.on('data', (c) => {
-    reqChunks.push(Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf8'));
+    if (bodyTooLarge) return;
+    const buf = Buffer.isBuffer(c) ? c : Buffer.from(String(c), 'utf8');
+    reqBytes += buf.length;
+    if (reqBytes > config.MAX_BODY_BYTES) {
+      bodyTooLarge = true;
+      res.writeHead(413, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ error: { message: `request body exceeds ${config.MAX_BODY_BYTES} bytes` } }));
+      req.destroy();
+      return;
+    }
+    reqChunks.push(buf);
   });
   req.on('end', async () => {
+    if (bodyTooLarge || res.writableEnded) return;
     const raw = Buffer.concat(reqChunks).toString('utf8');
     let body;
     try {
@@ -670,7 +719,7 @@ const server = http.createServer((req, res) => {
       : rawFloors;
     const activePostBlocks = isEmptyFloorsFallback ? [] : postBlocks;
     const { primary, alias } = session.chatKeys(messages);
-    const queueKey = alias || primary;
+    const queueKey = primary || alias;
 
     const keepAlive = setInterval(() => {
       if (res.writableEnded || res.destroyed) {
@@ -713,26 +762,27 @@ const server = http.createServer((req, res) => {
               out.delta(delta);
             },
           });
-          if (resTurn.code !== 0 && !resTurn.text && sentCount === 0 && !ac.signal.aborted) {
-            const fb = pickFallback(modelUsed, resTurn.stderr);
-            if (fb) {
-              log('fallback(stateless)', { from: modelUsed, to: fb });
-              modelUsed = fb;
-              out.setModel(modelUsed);
-              resTurn = await runTurn({
-                prompt,
-                model: modelUsed,
-                effort,
-                cwd: sysDir,
-                signal: ac.signal,
-                onDelta: (delta) => {
-                  if (res.writableEnded || res.destroyed) return;
-                  sentCount += delta.length;
-                  out.setModel(modelUsed);
-                  out.delta(delta);
-                },
-              });
-            }
+          const triedStateless = new Set([modelUsed]);
+          while (resTurn.code !== 0 && !resTurn.text && sentCount === 0 && !ac.signal.aborted) {
+            const fb = pickFallback(modelUsed, resTurn.stderr, triedStateless);
+            if (!fb) break;
+            triedStateless.add(fb);
+            log('fallback(stateless)', { from: modelUsed, to: fb });
+            modelUsed = fb;
+            out.setModel(modelUsed);
+            resTurn = await runTurn({
+              prompt,
+              model: modelUsed,
+              effort,
+              cwd: sysDir,
+              signal: ac.signal,
+              onDelta: (delta) => {
+                if (res.writableEnded || res.destroyed) return;
+                sentCount += delta.length;
+                out.setModel(modelUsed);
+                out.delta(delta);
+              },
+            });
           }
           return resTurn;
         }, { onPreempt: () => ac.abort() });
@@ -760,13 +810,23 @@ const server = http.createServer((req, res) => {
         const resolved = session.resolveSession(state, messages);
         const sessionKey = resolved.key;
         const rawSess = resolved.sess;
-        const effectiveSess = getEffectiveSession(rawSess);
-        const sessForDrift = rawSess
-          ? { ...rawSess, convId: effectiveSess ? effectiveSess.convId : null }
-          : null;
-        const drift = session.driftOf(sessForDrift, floors);
+        const selection = session.selectBranch(rawSess, floors, {
+          chatKey: sessionKey,
+          workspacesDir: config.WORKSPACES,
+          model,
+          keys: resolved.keys,
+          isHealthy: isTranscriptHealthy,
+        });
+        const branch = selection.branch;
+        const branches = selection.branches;
+        const { branchId, branchCount, lcp, branchAction, drift } = selection;
 
-        const workspaceDir = (rawSess && rawSess.dir) ? rawSess.dir : path.join(config.WORKSPACES, sessionKey);
+        const workspaceDir = (branch && branch.dir)
+          ? branch.dir
+          : (branchId === 'b1'
+            ? path.join(config.WORKSPACES, sessionKey)
+            : path.join(config.WORKSPACES, sessionKey, branchId));
+        branch.dir = workspaceDir;
         const timelinePath = path.join(workspaceDir, 'timeline.md');
         const timelineBakPath = path.join(workspaceDir, 'timeline.bak.md');
         try {
@@ -789,11 +849,26 @@ const server = http.createServer((req, res) => {
         let nextSwipeStreak = 0;
         let isContinue = false;
         let newMsgCount = 0;
+        const branchHashes = Array.isArray(branch.hashes) ? branch.hashes : [];
+
+        if (session.isStrictSystem()) {
+          const preLayered = archive.readLayeredState(
+            workspaceDir,
+            Math.floor(config.PROMPT_BUDGET * 0.35),
+            drift.divIdx > 0 ? drift.divIdx : undefined
+          );
+          session.checkStrictSystemBudget({
+            system: sysText,
+            systemBlocks,
+            state: preLayered.state,
+            budgetBytes: config.PROMPT_BUDGET,
+          });
+        }
 
         if (drift.kind === 'advance' || drift.kind === 'retry') {
           const sliceStart = drift.kind === 'advance'
             ? drift.divIdx
-            : ((effectiveSess && Array.isArray(effectiveSess.syncedHashes)) ? effectiveSess.syncedHashes.length : floors.length);
+            : (branchHashes.length > 0 ? branchHashes.length : floors.length);
           const newMsgs = floors.slice(sliceStart);
           newMsgCount = newMsgs.length;
 
@@ -821,22 +896,29 @@ const server = http.createServer((req, res) => {
               }
             }
           }
-          convIdToUse = effectiveSess.convId;
+          convIdToUse = branch.convId;
           nextSwipeStreak = drift.kind === 'retry'
-            ? ((effectiveSess && typeof effectiveSess.swipeStreak === 'number') ? effectiveSess.swipeStreak : 0)
+            ? (typeof branch.swipeStreak === 'number' ? branch.swipeStreak : 0)
             : 0;
         } else if (drift.kind === 'shallow') {
           prompt = session.buildOverride({ divIdx: drift.divIdx, floors });
-          convIdToUse = effectiveSess.convId;
-          nextSwipeStreak = ((effectiveSess && effectiveSess.swipeStreak) || 0) + 1;
+          convIdToUse = branch.convId;
+          nextSwipeStreak = (branch.swipeStreak || 0) + 1;
         } else {
-          if (drift.divIdx === 0) {
+          if (branchAction === 'reuse' && drift.divIdx === 0) {
             backupTimelineIfNeeded();
           }
-          trySeedTimeline(workspaceDir, floors);
-          const timeline = archive.readTimeline(
-            timelinePath,
-            Math.floor(config.PROMPT_BUDGET * 0.2),
+          if ((branchAction === 'new' || branchAction === 'fork') && !fs.existsSync(timelinePath)) {
+            const seeded = trySeedTimeline(workspaceDir, floors);
+            if (seeded && branchAction === 'fork') {
+              try {
+                archive.upsertFloor(timelinePath, lcp, '');
+              } catch {}
+            }
+          }
+          const layered = archive.readLayeredState(
+            workspaceDir,
+            Math.floor(config.PROMPT_BUDGET * 0.35),
             drift.divIdx > 0 ? drift.divIdx : undefined
           );
           prompt = session.buildBootstrap({
@@ -845,7 +927,9 @@ const server = http.createServer((req, res) => {
             floors,
             postBlocks: activePostBlocks,
             messages,
-            timeline,
+            state: layered.state,
+            chapters: layered.chapters,
+            timeline: layered.timeline,
             budgetBytes: config.PROMPT_BUDGET,
           });
           convIdToUse = null;
@@ -858,12 +942,20 @@ const server = http.createServer((req, res) => {
 
         log('turn start(session)', {
           key: sessionKey,
+          branchId,
+          branchCount,
+          lcp,
+          branchAction,
           drift: drift.kind,
           divIdx: drift.divIdx,
           convId: convIdToUse || 'NEW',
           model,
           promptBytes: Buffer.byteLength(prompt, 'utf8'),
           floors: floors.length,
+      sysBytes: messages.reduce((n, x) => n + ((x && String(x.role) === 'system') ? Buffer.byteLength(String(x.content || ''), 'utf8') : 0), 0),
+      turnBytes: messages.reduce((n, x) => n + ((x && String(x.role) !== 'system') ? Buffer.byteLength(String(x.content || ''), 'utf8') : 0), 0),
+      roleCounts: messages.reduce((a, x) => { const r = (x && x.role) || '?'; a[r] = (a[r] || 0) + 1; return a; }, {}),
+      biggestPreview: (() => { let best = '', len = -1; for (const x of messages) { const c = String((x && x.content) || ''); const n = Buffer.byteLength(c, 'utf8'); if (n > len) { len = n; best = c; } } return len <= 0 ? '' : ('[' + len + 'B] ' + best.slice(0, 200).replace(/\s+/g, ' ')); })(),
           floorCount: floors.length,
           presetBlockBytes,
           postBlockBytes,
@@ -901,10 +993,10 @@ const server = http.createServer((req, res) => {
           onDelta: (delta) => {
             if (res.writableEnded || res.destroyed || ac.signal.aborted) return;
             rawDeltaCount += delta.length;
-            out.setModel(modelUsed);
-            out.start();
             const safe = filter.push(delta);
             if (safe) {
+              out.setModel(modelUsed);
+              out.start();
               streamedText += safe;
               out.delta(safe);
             }
@@ -915,10 +1007,17 @@ const server = http.createServer((req, res) => {
 
         if (r.conversationMissing && !ac.signal.aborted) {
           backupTimelineIfNeeded();
-          trySeedTimeline(workspaceDir, floors);
-          const timeline = archive.readTimeline(
-            timelinePath,
-            Math.floor(config.PROMPT_BUDGET * 0.2),
+          if ((branchAction === 'new' || branchAction === 'fork') && !fs.existsSync(timelinePath)) {
+            const seeded = trySeedTimeline(workspaceDir, floors);
+            if (seeded && branchAction === 'fork') {
+              try {
+                archive.upsertFloor(timelinePath, lcp, '');
+              } catch {}
+            }
+          }
+          const layered = archive.readLayeredState(
+            workspaceDir,
+            Math.floor(config.PROMPT_BUDGET * 0.35),
             drift.divIdx > 0 ? drift.divIdx : undefined
           );
           prompt = session.buildBootstrap({
@@ -927,26 +1026,29 @@ const server = http.createServer((req, res) => {
             floors,
             postBlocks: activePostBlocks,
             messages,
-            timeline,
+            state: layered.state,
+            chapters: layered.chapters,
+            timeline: layered.timeline,
             budgetBytes: config.PROMPT_BUDGET,
           });
           convIdToUse = null;
           nextSwipeStreak = 0;
           rebuiltInRequest = true;
           resetTurnBuffer();
-          log('rebuild on conversationMissing(session)', { key: sessionKey, model: modelUsed });
+          log('rebuild on conversationMissing(session)', { key: sessionKey, branchId, model: modelUsed });
           r = await executeTurn(prompt, null);
         }
 
-        if (r.code !== 0 && !r.text && rawDeltaCount === 0 && !ac.signal.aborted) {
-          const fb = pickFallback(modelUsed, r.stderr);
-          if (fb) {
-            log('fallback(session)', { key: sessionKey, from: modelUsed, to: fb });
-            modelUsed = fb;
-            out.setModel(modelUsed);
-            resetTurnBuffer();
-            r = await executeTurn(prompt, convIdToUse);
-          }
+        const triedSession = new Set([modelUsed]);
+        while (r.code !== 0 && !r.text && !streamedText && !out.headersSent && !ac.signal.aborted) {
+          const fb = pickFallback(modelUsed, r.stderr, triedSession);
+          if (!fb) break;
+          triedSession.add(fb);
+          log('fallback(session)', { key: sessionKey, branchId, from: modelUsed, to: fb });
+          modelUsed = fb;
+          out.setModel(modelUsed);
+          resetTurnBuffer();
+          r = await executeTurn(prompt, convIdToUse);
         }
 
         clearInterval(keepAlive);
@@ -956,6 +1058,7 @@ const server = http.createServer((req, res) => {
           const reason = r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`;
           log('turn done(session)', {
             key: sessionKey,
+            branchId,
             drift: drift.kind,
             stateCommit: false,
             reason,
@@ -988,6 +1091,7 @@ const server = http.createServer((req, res) => {
             : (r.conversationMissing ? 'conversation_missing' : `exit_code_${r.code}`);
           log('turn done(session)', {
             key: sessionKey,
+            branchId,
             drift: drift.kind,
             stateCommit: false,
             reason,
@@ -1000,18 +1104,20 @@ const server = http.createServer((req, res) => {
 
         const { record } = archive.extractRecord(r.text || '');
         const currentFloor = floors.length;
-        if (drift.kind === 'deep' && drift.divIdx > 0) {
-          try {
-            archive.upsertFloor(timelinePath, drift.divIdx, '');
-          } catch (err) {
-            log('upsertFloor error:', err.message);
+        if (branchAction !== 'fork') {
+          if ((drift.kind === 'deep' || drift.kind === 'shallow') && drift.divIdx > 0) {
+            try {
+              archive.upsertFloor(timelinePath, drift.divIdx, '');
+            } catch (err) {
+              log('upsertFloor error:', err.message);
+            }
           }
-        }
-        if (record !== null || drift.kind === 'shallow') {
-          try {
-            archive.upsertFloor(timelinePath, currentFloor, record || '');
-          } catch (err) {
-            log('upsertFloor error:', err.message);
+          if (record !== null || drift.kind === 'shallow') {
+            try {
+              archive.upsertFloor(timelinePath, currentFloor, record || '');
+            } catch (err) {
+              log('upsertFloor error:', err.message);
+            }
           }
         }
 
@@ -1019,6 +1125,7 @@ const server = http.createServer((req, res) => {
         const syncedHashes = floors.map(session.layerHash);
         const numberedFloorCount = floors.filter((f) => session.FLOOR_MARKER_HEAD_RE.test(textOf(f.content))).length;
         const lastFloorHasMarker = floors.length > 0 && session.FLOOR_MARKER_HEAD_RE.test(textOf(floors[floors.length - 1].content));
+        let hasAppendedReply = false;
 
         if (isContinue && syncedHashes.length > 0) {
           if (trimmedReply && !lastFloorHasMarker) {
@@ -1032,11 +1139,42 @@ const server = http.createServer((req, res) => {
           }
         } else if (trimmedReply && !lastFloorHasMarker) {
           syncedHashes.push(session.layerHash({ role: 'assistant', content: trimmedReply }));
+          hasAppendedReply = true;
         }
 
-        const prevTurns = (drift.kind === 'deep' || rebuiltInRequest || !effectiveSess) ? 0 : (effectiveSess.turns || 0);
+        const prevTurns = (drift.kind === 'deep' || rebuiltInRequest) ? 0 : (branch.turns || 0);
         const turns = (drift.kind === 'retry' && !rebuiltInRequest) ? Math.max(1, prevTurns) : prevTurns + 1;
         const forceDeepNext = turns >= config.MAX_TURNS_PER_SESSION;
+
+        if (branchAction !== 'fork') {
+          try {
+            const summarizeWithModel = async (inputText, meta = {}) => {
+              const sumPrompt = meta.kind === 'state'
+                ? `${config.NON_CODING_FRAME}\n` +
+                  '请根据以下幕级摘要重写常驻状态卡（严格 ≤ 6KB，只写“当前有效状态”，不写历史过程）。\n' +
+                  '必须涵盖：人物当前关系、持有物、当前地点、未兑现承诺、未回收伏笔。只输出状态卡正文：\n\n' +
+                  inputText
+                : `${config.NON_CODING_FRAME}\n` +
+                  `请将以下第 ${meta.startFloor || 1}-${meta.endFloor || 20} 层剧情归档合并压缩为一段幕级摘要（不超过 500 字），` +
+                  '保留关键事件、关系与状态变化、未回收伏笔，只输出摘要正文：\n\n' +
+                  inputText;
+              const sumRes = await runTurn({
+                prompt: sumPrompt,
+                model: SUMMARY_MODEL,
+                effort: 'low',
+                cwd: ensureSysWorkspace(),
+                signal: ac.signal,
+              });
+              return archive.extractRecord(sumRes.text || '').clean.trim();
+            };
+            await archive.compactLayeredState(workspaceDir, {
+              turns,
+              summarize: summarizeWithModel,
+            });
+          } catch (err) {
+            log('compactLayeredState error:', err.message);
+          }
+        }
 
         const postTurnAlias = (floors.length === 1 && trimmedReply)
           ? session.aliasKey([{ role: 'system', content: sysText }, floors[0], { role: 'assistant', content: trimmedReply }])
@@ -1045,6 +1183,7 @@ const server = http.createServer((req, res) => {
         const prevRec = latestState[sessionKey] || rawSess || {};
         const candidateKeys = Array.from(new Set([
           ...(Array.isArray(prevRec.keys) ? prevRec.keys : []),
+          ...(Array.isArray(branch.keys) ? branch.keys : []),
           ...(Array.isArray(resolved.keys) ? resolved.keys : []),
           postTurnAlias,
         ].filter(Boolean)));
@@ -1059,26 +1198,39 @@ const server = http.createServer((req, res) => {
           return true;
         });
 
-        latestState[sessionKey] = {
-          convId: forceDeepNext ? null : (r.conversationId || convIdToUse || null),
-          model: modelUsed,
+        const now = Date.now();
+        const committedConvId = forceDeepNext ? null : (convIdToUse || r.conversationId || null);
+        const updatedBranch = {
+          branchId,
+          convId: committedConvId,
+          hashes: syncedHashes,
           turns,
-          keys: mergedKeys,
-          syncedHashes,
-          numberedFloorCount,
-          swipeStreak: nextSwipeStreak,
           dir: workspaceDir,
-          sysHead: prevRec.sysHead || resolved.sysHead,
-          updatedAt: Date.now(),
-          conversationMissing: false,
+          model: modelUsed,
+          lastUsedAt: now,
+          swipeStreak: nextSwipeStreak,
+          keys: mergedKeys,
+          ...(numberedFloorCount > 0 ? { numberedFloorCount } : {}),
+          ...(hasAppendedReply ? { hasAppendedReply: true } : {}),
+        };
+        const finalBranches = branches.map((b) => (b.branchId === branchId ? updatedBranch : b));
+
+        latestState[sessionKey] = {
+          branches: finalBranches,
+          lastBranchId: branchId,
+          keys: mergedKeys,
+          ...(prevRec.sysHead || resolved.sysHead ? { sysHead: prevRec.sysHead || resolved.sysHead } : {}),
+          updatedAt: now,
         };
         session.saveState(latestState);
         out.finish(r.usage);
 
         log('turn done(session)', {
           key: sessionKey,
+          branchId,
+          branchAction,
           drift: drift.kind,
-          convId: latestState[sessionKey].convId,
+          convId: committedConvId,
           turns,
           forceDeepNext,
           hasRecord: record !== null,
